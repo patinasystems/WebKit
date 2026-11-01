@@ -161,6 +161,7 @@ void JSSynchronousGarbageCollectForDebugging(JSContextRef ctx)
 
     JSGlobalObject* globalObject = toJS(ctx);
     VM& vm = globalObject->vm();
+    JSLockHolder locker(vm);
 
     vm.heap.collectNow(Sync, CollectionScope::Full);
 }

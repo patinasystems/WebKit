@@ -128,7 +128,13 @@ if (NOT ENABLE_STATIC_JSC)
 endif ()
 
 if (USE_BUN_JSC_ADDITIONS)
-    set(CMAKE_POSITION_INDEPENDENT_CODE False)
+    if (ENABLE_STATIC_JSC)
+        set(CMAKE_POSITION_INDEPENDENT_CODE False)
+    else ()
+        # A shared JavaScriptCore links bmalloc and WTF in as object libraries, which are not
+        # position-independent by default; libpas's TLS then cannot go in a shared object.
+        set(CMAKE_POSITION_INDEPENDENT_CODE True)
+    endif ()
 endif ()
 
 if (WIN32)

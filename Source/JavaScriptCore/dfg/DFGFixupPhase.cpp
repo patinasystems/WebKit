@@ -37,6 +37,7 @@
 #include "DOMJITCallDOMGetterSnippet.h"
 #include "GetterSetter.h"
 #include "JSCInlines.h"
+#include "JSScope.h"
 #include "RegExpConstructor.h"
 #include "TypeLocation.h"
 
@@ -4325,6 +4326,21 @@ private:
 
         if (isFinalObjectSpeculation(node->child1()->prediction())) {
             fixEdge<FinalObjectUse>(node->child1());
+            node->convertToIdentity();
+            return;
+        }
+
+        // Any other object is its own `this` unless it is a scope (JSScope::toThis, the only
+        // override isToThisAnIdentity knows), so an object prediction folds with a scope check
+        // beside ObjectUse. Without it, a receiver whose type has no use kind of its own (an
+        // embedder's object type past LastJSCObjectType, SpecObjectOther) keeps a generic ToThis
+        // once op_to_this's cache has seen a second structure; its result is HeapTop in strict
+        // mode, so every access on `this` re-checks structures and none hoists.
+        if (node->child1()->shouldSpeculateObject() && !m_graph.hasExitSite(node->origin.semantic, BadType)) {
+            m_insertionSet.insertNode(
+                m_indexInBlock, SpecNone, CheckNotJSCast, node->origin,
+                OpInfo(JSScope::info()), Edge(node->child1().node(), CellUse));
+            fixEdge<ObjectUse>(node->child1());
             node->convertToIdentity();
             return;
         }

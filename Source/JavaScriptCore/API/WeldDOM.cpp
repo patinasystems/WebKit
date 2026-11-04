@@ -2,8 +2,9 @@
 // ABI weld-jsc and weld-dom call (Kitchen step 5.25 PR1; design in Kitchen's
 // shared/notes/work/weld/research/native-dom-core.md §3.3).
 //
-// - JSWeldNode: a node wrapper cell holding (slot, generation, table): 32 bytes, plus a butterfly
-//   only for the properties script (or web-front's JS classes) adds. Its prototype is a web-front
+// - JSWeldNode: a node wrapper cell: a JSFinalObject's header and 6 inline property slots (where
+//   web-front's own fields on a wrapper live), then (slot, generation, table), 80 bytes. Script's
+//   expandos past those 6 go to a butterfly, as on any object. Its prototype is a web-front
 //   class's; `NodeBase` is the native base those classes extend, so `new HTMLDivElement(...)` makes
 //   one when web-front armed it for a slot (`arm`), and an ordinary object otherwise.
 // - WeldDomTable: one per document, a flat array of Weak handles indexed by slot (8 bytes a slot, a
@@ -45,6 +46,7 @@
 #include "WeakSetInlines.h"
 #include <array>
 #include <wtf/FastMalloc.h>
+#include <bit>
 
 using namespace JSC;
 
@@ -53,11 +55,15 @@ extern "C" {
 // k's shared copy (`[parent][first][last][prev][next][rslot]`, PAGE words each), or a page of NONE
 // links while it has none (released, or the session ended). Rust owns it and keeps its address for
 // the document's life. `count` never shrinks, and a wrapper is only made for a slot below it, so
-// the inline reads check neither.
+// the inline reads check neither. `changed` and `changedContext` are the fork's: the table sets them
+// when it takes the links and clears them before it releases them, and Rust calls `changed` after
+// each write of `pages` or `count`, so the table reads its own copy of both (one load less a read).
 struct WeldDomLinks {
     uint32_t* const* pages;
     uint32_t count;
     uint32_t reserved;
+    void (*changed)(void*);
+    void* changedContext;
 };
 }
 
@@ -81,12 +87,26 @@ class WeldDomTable final : public WeakHandleOwner {
 public:
     WeldDomTable(VM& vm, const WeldDomLinks* links, void (*release)(void*), void* releaseContext, uint32_t tag)
         : m_vm(vm)
-        , m_links(links)
-        , m_rustLinks(links)
+        , m_pages(links->pages)
+        , m_count(links->count)
+        , m_rustLinks(const_cast<WeldDomLinks*>(links))
         , m_release(release)
         , m_releaseContext(releaseContext)
         , m_tag(tag)
     {
+        m_rustLinks->changedContext = this;
+        m_rustLinks->changed = &linksChanged;
+    }
+
+    // Rust wrote `pages` or `count` (a page was added or released): read them again, unless a
+    // replay's copy is what the getters read.
+    static void linksChanged(void* context)
+    {
+        auto* table = static_cast<WeldDomTable*>(context);
+        if (!table->m_replaying) {
+            table->m_pages = table->m_rustLinks->pages;
+            table->m_count = table->m_rustLinks->count;
+        }
     }
 
     ~WeldDomTable() final;
@@ -97,11 +117,14 @@ public:
                 WeakSet::deallocate(m_entries[i]);
         }
         fastFree(m_entries);
+        fastFree(m_live);
+        m_rustLinks->changed = nullptr;
+        m_rustLinks->changedContext = nullptr;
         if (m_release)
             m_release(m_releaseContext);
     }
 
-    bool hasSlot(uint32_t slot) const { return slot != kNone && (slot >> kPageShift) < m_links->count; }
+    bool hasSlot(uint32_t slot) const { return slot != kNone && (slot >> kPageShift) < m_count; }
 
     // A page of NONE links, for a page the replay copy has none of.
     static uint32_t* nonePage()
@@ -129,8 +152,9 @@ public:
             m_replayPages[k] = pages[k].second;
             m_replayBuffers.append(WTF::move(pages[k].first));
         }
-        m_replayLinks = { m_replayPages.span().data(), count, 0 };
-        m_links = &m_replayLinks;
+        m_replaying = true;
+        m_pages = m_replayPages.span().data();
+        m_count = count;
     }
 
     void endReplay()
@@ -138,8 +162,9 @@ public:
         for (auto& buffer : m_replayBuffers)
             buffer->unpin();
         m_replayBuffers.clear();
-        m_links = m_rustLinks;
-        m_replayLinks = { nullptr, 0, 0 };
+        m_replaying = false;
+        m_pages = m_rustLinks->pages;
+        m_count = m_rustLinks->count;
         m_replayPages.clear();
     }
 
@@ -147,7 +172,7 @@ public:
     {
         if (!hasSlot(slot))
             return kNone;
-        return m_links->pages[slot >> kPageShift][column * kPage + (slot & (kPage - 1))];
+        return m_pages[slot >> kPageShift][column * kPage + (slot & (kPage - 1))];
     }
 
     uint8_t type(uint32_t slot) const { return slot < m_typesLength ? m_types[slot] : 0; }
@@ -217,15 +242,28 @@ public:
             while (size <= slot)
                 size *= 2;
             auto* entries = static_cast<WeakImpl**>(fastZeroedMalloc(size * sizeof(WeakImpl*)));
-            if (m_size)
+            auto* live = static_cast<uint64_t*>(fastZeroedMalloc(size / 64 * sizeof(uint64_t)));
+            if (m_size) {
                 memcpy(entries, m_entries, m_size * sizeof(WeakImpl*));
+                memcpy(live, m_live, m_size / 64 * sizeof(uint64_t));
+            }
             fastFree(m_entries);
+            fastFree(m_live);
             m_entries = entries;
+            m_live = live;
             m_size = size;
         }
         if (m_entries[slot])
             WeakSet::deallocate(m_entries[slot]);
         m_entries[slot] = WeakSet::allocate(object, this, reinterpret_cast<void*>(static_cast<uintptr_t>(slot)));
+        m_live[slot / 64] |= uint64_t(1) << (slot % 64);
+    }
+
+    void clear(uint32_t slot)
+    {
+        WeakSet::deallocate(m_entries[slot]);
+        m_entries[slot] = nullptr;
+        m_live[slot / 64] &= ~(uint64_t(1) << (slot % 64));
     }
 
     void drop(uint32_t slot, JSObject* only = nullptr)
@@ -234,8 +272,7 @@ public:
             return;
         if (only && m_entries[slot]->jsValue() != JSValue(only))
             return;
-        WeakSet::deallocate(m_entries[slot]);
-        m_entries[slot] = nullptr;
+        clear(slot);
     }
 
     // The node types by slot, read in place: the buffer is pinned (never detached) while named.
@@ -257,16 +294,20 @@ public:
         return n;
     }
 
-    // The marking constraint: every marked wrapper's tree root is an opaque root.
+    // The marking constraint: every marked wrapper's tree root is an opaque root. It visits the
+    // slots with an entry (`m_live`), not every slot the document ever had.
     template<typename Visitor>
     void addRoots(Visitor& visitor)
     {
-        for (uint32_t i = 0; i < m_size; ++i) {
-            WeakImpl* impl = m_entries[i];
-            if (!impl || impl->state() != WeakImpl::Live)
-                continue;
-            if (visitor.isMarked(impl->jsValue().asCell()))
-                visitor.addOpaqueRoot(rootKey(i));
+        for (uint32_t word = 0; word < m_size / 64; ++word) {
+            for (uint64_t bits = m_live[word]; bits; bits &= bits - 1) {
+                uint32_t i = word * 64 + std::countr_zero(bits);
+                WeakImpl* impl = m_entries[i];
+                if (impl->state() != WeakImpl::Live)
+                    continue;
+                if (visitor.isMarked(impl->jsValue().asCell()))
+                    visitor.addOpaqueRoot(rootKey(i));
+            }
         }
     }
 
@@ -283,27 +324,29 @@ public:
     void finalize(JSC::Handle<JSC::Unknown> handle, void* context) final
     {
         uint32_t slot = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(context));
-        if (slot < m_size && m_entries[slot] == WeakImpl::asWeakImpl(handle.slot())) {
-            WeakSet::deallocate(m_entries[slot]);
-            m_entries[slot] = nullptr;
-        }
+        if (slot < m_size && m_entries[slot] == WeakImpl::asWeakImpl(handle.slot()))
+            clear(slot);
         ++m_collected;
     }
 
     static constexpr ptrdiff_t offsetOfEntries() { return OBJECT_OFFSETOF(WeldDomTable, m_entries); }
     static constexpr ptrdiff_t offsetOfSize() { return OBJECT_OFFSETOF(WeldDomTable, m_size); }
-    static constexpr ptrdiff_t offsetOfLinks() { return OBJECT_OFFSETOF(WeldDomTable, m_links); }
+    static constexpr ptrdiff_t offsetOfPages() { return OBJECT_OFFSETOF(WeldDomTable, m_pages); }
     static constexpr ptrdiff_t offsetOfTypes() { return OBJECT_OFFSETOF(WeldDomTable, m_types); }
     static constexpr ptrdiff_t offsetOfTypesLength() { return OBJECT_OFFSETOF(WeldDomTable, m_typesLength); }
 
     VM& m_vm;
     WeakImpl** m_entries { nullptr };
+    // One bit a slot: whether `m_entries` has an entry there (the constraint's scan).
+    uint64_t* m_live { nullptr };
     uint32_t m_size { 0 };
     uint32_t m_collected { 0 };
-    // What the getters read: Rust's page table, or the replay copy's (`beginReplay`).
-    const WeldDomLinks* m_links;
-    const WeldDomLinks* m_rustLinks;
-    WeldDomLinks m_replayLinks { nullptr, 0, 0 };
+    // What the getters read: Rust's pages (kept current by `linksChanged`), or the replay copy's
+    // (`beginReplay`).
+    uint32_t* const* m_pages;
+    uint32_t m_count;
+    bool m_replaying { false };
+    WeldDomLinks* m_rustLinks;
     Vector<uint32_t*> m_replayPages;
     Vector<RefPtr<ArrayBuffer>> m_replayBuffers;
     const uint8_t* m_types { nullptr };
@@ -386,16 +429,17 @@ public:
 
     static Structure* createStructure(VM& vm, JSGlobalObject* globalObject, JSValue prototype)
     {
-        return Structure::create(vm, globalObject, prototype, TypeInfo(WeldNodeType, StructureFlags), info());
+        // Subclass structures keep this capacity (runtime/StructureCache.cpp).
+        return Structure::create(vm, globalObject, prototype, TypeInfo(WeldNodeType, StructureFlags), info(), NonArray, inlineCapacity);
     }
 
     static JSWeldNode* create(VM& vm, Structure* structure, WeldDomTable* table, uint32_t slot, uint32_t gen)
     {
-        auto* node = new (NotNull, allocateCell<JSWeldNode>(vm)) JSWeldNode(vm, structure);
+        RELEASE_ASSERT(structure->inlineCapacity() == inlineCapacity);
+        auto* node = new (NotNull, allocateCell<JSWeldNode>(vm, allocationSize)) JSWeldNode(vm, structure);
+        memset(static_cast<void*>(node->inlineStorageUnsafe()), 0, inlineCapacity * sizeof(EncodedJSValue));
+        node->native() = { slot, gen, table };
         node->finishCreation(vm);
-        node->m_slot = slot;
-        node->m_gen = gen;
-        node->m_table = table;
         return node;
     }
 
@@ -410,13 +454,24 @@ public:
         return snippet;
     }
 
-    static constexpr ptrdiff_t offsetOfSlot() { return OBJECT_OFFSETOF(JSWeldNode, m_slot); }
-    static constexpr ptrdiff_t offsetOfGen() { return OBJECT_OFFSETOF(JSWeldNode, m_gen); }
-    static constexpr ptrdiff_t offsetOfTable() { return OBJECT_OFFSETOF(JSWeldNode, m_table); }
+    // Inline property storage, as a JSFinalObject has: web-front's own fields on a wrapper (`_i`,
+    // `_g`, `_m`, `_doc`, and an element's `localName` and `namespaceURI`) load in place, not
+    // through a butterfly. The native fields follow it.
+    static constexpr unsigned inlineCapacity = 6;
+    struct Native {
+        uint32_t slot;
+        uint32_t gen;
+        WeldDomTable* table;
+    };
+    static constexpr size_t offsetOfNative = JSObject::offsetOfInlineStorage() + inlineCapacity * sizeof(WriteBarrier<Unknown>);
+    static constexpr size_t allocationSize = offsetOfNative + sizeof(Native);
 
-    uint32_t m_slot { kNone };
-    uint32_t m_gen { 0 };
-    WeldDomTable* m_table { nullptr };
+    Native& native() { return *std::bit_cast<Native*>(std::bit_cast<char*>(this) + offsetOfNative); }
+    uint32_t slot() { return native().slot; }
+    WeldDomTable* table() { return native().table; }
+
+    static constexpr ptrdiff_t offsetOfSlot() { return offsetOfNative + offsetof(Native, slot); }
+    static constexpr ptrdiff_t offsetOfTable() { return offsetOfNative + offsetof(Native, table); }
 
 private:
     JSWeldNode(VM& vm, Structure* structure)
@@ -424,15 +479,19 @@ private:
     {
     }
 };
-static_assert(sizeof(JSWeldNode) == 32, "a node wrapper is 32 bytes (step 5.25 gate)");
+static_assert(sizeof(JSWeldNode) == JSObject::offsetOfInlineStorage(), "the native fields live past the inline storage");
+static_assert(JSWeldNode::allocationSize == 80, "a node wrapper is a JSFinalObject's 64 bytes plus (slot, gen, table)");
 
 template<typename Visitor>
 void JSWeldNode::visitChildrenImpl(JSCell* cell, Visitor& visitor)
 {
     auto* thisObject = uncheckedDowncast<JSWeldNode>(cell);
     ASSERT_GC_OBJECT_INHERITS(thisObject, info());
-    Base::visitChildren(thisObject, visitor);
-    if (WeldDomTable* table = thisObject->m_table)
+    // The cell, its butterfly and its inline storage (the structure's inline size), as a
+    // JSFinalObject's: the inline storage starts at the same offset (JSObject::offsetOfInlineStorage),
+    // and the native fields past it hold no JS values.
+    JSFinalObject::visitChildren(thisObject, visitor);
+    if (WeldDomTable* table = thisObject->table())
         visitor.appendUnbarriered(table->m_cell);
 }
 DEFINE_VISIT_CHILDREN(JSWeldNode);
@@ -622,7 +681,7 @@ OperationReturnType<EncodedJSValue> JIT_OPERATION_ATTRIBUTES operationWeldTree(J
     JITOperationPrologueCallFrameTracer tracer(vm, callFrame);
     auto scope = DECLARE_THROW_SCOPE(vm);
     auto* node = static_cast<JSWeldNode*>(pointer);
-    JSValue result = wrapSlot(globalObject, *node->m_table, readGetter(*node->m_table, node->m_slot, getter));
+    JSValue result = wrapSlot(globalObject, *node->table(), readGetter(*node->table(), node->slot(), getter));
     OPERATION_RETURN(scope, JSValue::encode(result));
 }
 
@@ -632,23 +691,22 @@ JSC_DEFINE_CUSTOM_GETTER(weldTreeGetter, (JSGlobalObject* globalObject, EncodedJ
     VM& vm = globalObject->vm();
     auto scope = DECLARE_THROW_SCOPE(vm);
     auto* node = dynamicDowncast<JSWeldNode>(JSValue::decode(thisValue));
-    if (!node || !node->m_table) [[unlikely]]
+    if (!node || !node->table()) [[unlikely]]
         return throwVMTypeError(globalObject, scope, "Not a weld-dom node"_s);
-    RELEASE_AND_RETURN(scope, JSValue::encode(wrapSlot(globalObject, *node->m_table, readGetter(*node->m_table, node->m_slot, getter))));
+    RELEASE_AND_RETURN(scope, JSValue::encode(wrapSlot(globalObject, *node->table(), readGetter(*node->table(), node->slot(), getter))));
 }
 
 #if ENABLE(JIT)
 using Jump = CCallHelpers::Jump;
 using JumpList = CCallHelpers::JumpList;
 
-// out = column `column` of slot `slot` (links in `links`): `slot` is a live node's or one its
-// links name, so its page has an entry (WeldDomLinks). Clobbers `tmp`. 32-bit ops zero the upper
-// halves, so indexes are clean.
-void emitLink(CCallHelpers& jit, GPRReg links, GPRReg slot, unsigned column, GPRReg out, GPRReg tmp)
+// out = column `column` of slot `slot` (the page addresses in `pages`): `slot` is a live node's or
+// one its links name, so its page has an entry (WeldDomLinks). Clobbers `tmp`. 32-bit ops zero the
+// upper halves, so indexes are clean.
+void emitLink(CCallHelpers& jit, GPRReg pages, GPRReg slot, unsigned column, GPRReg out, GPRReg tmp)
 {
     jit.urshift32(slot, CCallHelpers::TrustedImm32(kPageShift), tmp);
-    jit.loadPtr(CCallHelpers::Address(links, OBJECT_OFFSETOF(WeldDomLinks, pages)), out);
-    jit.loadPtr(CCallHelpers::BaseIndex(out, tmp, CCallHelpers::TimesEight), out);
+    jit.loadPtr(CCallHelpers::BaseIndex(pages, tmp, CCallHelpers::TimesEight), out);
     jit.and32(CCallHelpers::TrustedImm32(kPage - 1), slot, tmp);
     jit.load32(CCallHelpers::BaseIndex(out, tmp, CCallHelpers::TimesFour, column * kPage * 4), out);
 }
@@ -690,14 +748,14 @@ Ref<DOMJIT::CallDOMGetterSnippet> compileTreeGetter()
         GPRReg globalObject = params[2].gpr();
         GPRReg slot = params.gpScratch(0);
         GPRReg table = params.gpScratch(1);
-        GPRReg links = params.gpScratch(2);
+        GPRReg pages = params.gpScratch(2);
         GPRReg target = params.gpScratch(3);
 
         JumpList slow;
         JumpList nullCases;
         jit.load32(CCallHelpers::Address(node, JSWeldNode::offsetOfSlot()), slot);
         jit.loadPtr(CCallHelpers::Address(node, JSWeldNode::offsetOfTable()), table);
-        jit.loadPtr(CCallHelpers::Address(table, WeldDomTable::offsetOfLinks()), links);
+        jit.loadPtr(CCallHelpers::Address(table, WeldDomTable::offsetOfPages()), pages);
 
         auto column = [](Getter g) -> unsigned {
             switch (g) {
@@ -714,7 +772,7 @@ Ref<DOMJIT::CallDOMGetterSnippet> compileTreeGetter()
             }
             return Parent;
         };
-        emitLink(jit, links, slot, column(getter), target, result);
+        emitLink(jit, pages, slot, column(getter), target, result);
 
         if constexpr (getter == Getter::ParentElement) {
             nullCases.append(jit.branch32(CCallHelpers::Equal, target, CCallHelpers::TrustedImm32(-1)));
@@ -728,7 +786,7 @@ Ref<DOMJIT::CallDOMGetterSnippet> compileTreeGetter()
             Jump found = jit.jump();
             notElement.link(&jit);
             jit.move(target, slot);
-            emitLink(jit, links, slot, step, target, result);
+            emitLink(jit, pages, slot, step, target, result);
             jit.jump().linkTo(loop, &jit);
             found.link(&jit);
         } else
@@ -957,11 +1015,9 @@ JSC_DEFINE_HOST_FUNCTION(weldRebind, (JSGlobalObject* globalObject, CallFrame* c
     if (!value.isObject() || !doc || !doc->table().hasSlot(slot))
         return JSValue::encode(jsBoolean(false));
     if (auto* node = dynamicDowncast<JSWeldNode>(value)) {
-        if (node->m_table)
-            node->m_table->drop(node->m_slot, node);
-        node->m_table = &doc->table();
-        node->m_slot = slot;
-        node->m_gen = slotArg(callFrame, 3);
+        if (node->table())
+            node->table()->drop(node->slot(), node);
+        node->native() = { slot, slotArg(callFrame, 3), &doc->table() };
         vm.writeBarrier(node);
     }
     doc->table().put(slot, asObject(value));
@@ -1002,7 +1058,7 @@ JSC_DEFINE_HOST_FUNCTION(weldOwner, (JSGlobalObject*, CallFrame* callFrame))
 // cellSize(): bytes of a node wrapper without expandos.
 JSC_DEFINE_HOST_FUNCTION(weldCellSize, (JSGlobalObject*, CallFrame*))
 {
-    return JSValue::encode(jsNumber(sizeof(JSWeldNode)));
+    return JSValue::encode(jsNumber(JSWeldNode::allocationSize));
 }
 
 // isNative(object): whether `object` is a node wrapper cell.

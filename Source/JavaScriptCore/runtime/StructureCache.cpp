@@ -101,7 +101,10 @@ Structure* StructureCache::emptyStructureForPrototypeFromBaseStructure(JSGlobalO
     if (prototype->anyObjectInChainMayInterceptIndexedAccesses() && hasIndexedProperties(indexingType))
         indexingType = (indexingType & ~IndexingShapeMask) | SlowPutArrayStorageShape;
 
-    return createEmptyStructure(globalObject, prototype, baseStructure->typeInfo(), baseStructure->classInfoForCells(), indexingType, 0, false, nullptr, shouldCacheStructure);
+    // A non-final base that declares inline storage (Weld's node wrappers, API/WeldDOM.cpp) keeps
+    // it: its cells are allocated with that capacity. Every other base has none, as before.
+    unsigned inlineCapacity = baseStructure->typeInfo().type() == FinalObjectType ? 0 : baseStructure->inlineCapacity();
+    return createEmptyStructure(globalObject, prototype, baseStructure->typeInfo(), baseStructure->classInfoForCells(), indexingType, inlineCapacity, false, nullptr, shouldCacheStructure);
 }
 
 Structure* StructureCache::emptyObjectStructureForPrototype(JSGlobalObject* globalObject, JSObject* prototype, unsigned inlineCapacity, bool makePolyProtoStructure, FunctionExecutable* executable)

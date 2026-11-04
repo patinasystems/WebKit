@@ -1249,6 +1249,8 @@ public:
     JSValue tryGetConstantClosureVar(JSValue base, ScopeOffset);
     JSValue tryGetConstantClosureVar(const AbstractValue&, ScopeOffset);
     JSValue tryGetConstantClosureVar(Node*, ScopeOffset);
+    // The value every scope with `symbolTable` holds at `offset`, watched (SymbolTableEntry::inferredValue()).
+    JSValue tryGetInferredClosureVar(SymbolTable*, ScopeOffset);
     
     JSArrayBufferView* tryGetFoldableView(JSValue);
     JSArrayBufferView* tryGetFoldableView(JSValue, ArrayMode arrayMode);

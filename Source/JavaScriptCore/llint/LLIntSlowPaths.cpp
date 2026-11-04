@@ -2524,7 +2524,7 @@ LLINT_SLOW_PATH_DECL(slow_path_put_to_scope)
         // to have already changed the value of the variable. Otherwise we might watch and constant-fold
         // to the Undefined value from before the assignment.
         if (metadata.m_watchpointSet)
-            metadata.m_watchpointSet->touch(vm, "Executed op_put_scope<ResolvedClosureVar>");
+            SymbolTableEntry::notifyWrite(vm, metadata.m_watchpointSet, value, "Executed op_put_scope<ResolvedClosureVar>");
         LLINT_END();
     }
 

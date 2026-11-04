@@ -44,7 +44,7 @@ void timeZoneDidChange()
     g_lastTimeZoneID.fetch_add(1, std::memory_order_relaxed);
 }
 
-#if !USE(TIME_ZONE_CHANGE_NOTIFICATIONS) || USE(BUN_JSC_ADDITIONS)
+#if !USE(TIME_ZONE_CHANGE_NOTIFICATIONS) || (USE(BUN_JSC_ADDITIONS) && !USE(GLIB))
 // Bun enables USE(TIME_ZONE_CHANGE_NOTIFICATIONS) so that DateCache consults
 // lastTimeZoneID(), but the runtime bumps it explicitly via timeZoneDidChange()
 // rather than relying on a platform notifier; JSCOnly never compiles a

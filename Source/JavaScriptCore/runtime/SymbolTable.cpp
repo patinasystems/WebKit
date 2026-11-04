@@ -58,6 +58,25 @@ void SymbolTableEntry::freeFatEntrySlow()
     delete fatEntry();
 }
 
+void SymbolTableEntry::notifyWrite(VM& vm, InlineWatchpointSet* set, JSValue value, const char* reason)
+{
+    if (set->state() == IsInvalidated)
+        return;
+    FatEntry* entry = FatEntry::fromWatchpointSet(set);
+    if ((entry->m_bits & ParameterSlotFlag) && value && !value.isCell()) {
+        if (set->state() == ClearWatchpoint) {
+            // The value first, so a compiler that sees IsWatched sees the value (inferredValue()).
+            entry->m_inferredValue = JSValue::encode(value);
+            WTF::storeStoreFence();
+            set->touch(vm, reason);
+            return;
+        }
+        if (entry->m_inferredValue == JSValue::encode(value))
+            return;
+    }
+    set->touch(vm, reason);
+}
+
 void SymbolTableEntry::inflate()
 {
     ASSERT(!isFat());
@@ -161,6 +180,8 @@ SymbolTable* SymbolTable::cloneScopePart(VM& vm, PropagateCloneInvalidationToOri
         if (!iter->value.varOffset().isScope())
             continue;
         SymbolTableEntry entry(iter->value.varOffset(), iter->value.getAttributes());
+        if (iter->value.isParameterSlot())
+            entry.setIsParameterSlot();
 
         if (hasScopedArgumentWatchpoints) {
             auto findIter = varOffsetToArgIndexMap.find(iter->value.varOffset());

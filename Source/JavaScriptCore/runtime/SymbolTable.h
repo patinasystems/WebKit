@@ -312,6 +312,46 @@ public:
         return &fatEntry()->m_watchpoints;
     }
 
+    // A captured parameter of a function with a simple parameter list. Every scope that has this
+    // symbol table writes the slot in the function's prologue, before any code can read it, so no
+    // scope is ever read while it still holds undefined.
+    bool isParameterSlot() const { return bits() & ParameterSlotFlag; }
+    void setIsParameterSlot()
+    {
+        ASSERT(!isFat());
+        m_bits |= ParameterSlotFlag;
+    }
+
+    // For a parameter slot, the watchpoint set stays IsWatched while every write, in every scope that
+    // has this symbol table, stores the same non-cell value: the value every such scope holds. Code
+    // may then fold reads of the variable from any of these scopes to it. Returns the empty value
+    // when there is no such value.
+    JSValue inferredValue() const
+    {
+        if (!isFat() || !isParameterSlot())
+            return JSValue();
+        const FatEntry* entry = fatEntry();
+        if (entry->m_watchpoints.state() != IsWatched)
+            return JSValue();
+        WTF::loadLoadFence();
+        return JSValue::decode(entry->m_inferredValue);
+    }
+
+    // A write of `value` to this variable in some scope, after the store. `set` is a watchpointSet()
+    // of some entry. Writes with no value to give use InlineWatchpointSet::touch(), which ends the
+    // inference too.
+    JS_EXPORT_PRIVATE static void notifyWrite(VM&, InlineWatchpointSet* set, JSValue, const char* reason);
+
+    // inferredValue() of the entry whose watchpointSet() is `set`.
+    static JSValue inferredValue(InlineWatchpointSet* set)
+    {
+        FatEntry* entry = FatEntry::fromWatchpointSet(set);
+        if (!(entry->m_bits & ParameterSlotFlag) || set->state() != IsWatched)
+            return JSValue();
+        WTF::loadLoadFence();
+        return JSValue::decode(entry->m_inferredValue);
+    }
+
 private:
     static const intptr_t SlimFlag = 0x1;
     static const intptr_t ReadOnlyFlag = 0x2;
@@ -321,7 +361,8 @@ private:
     static const intptr_t ScopeKindBits = 0x00;
     static const intptr_t StackKindBits = 0x20;
     static const intptr_t DirectArgumentKindBits = 0x30;
-    static const intptr_t FlagBits = 6;
+    static const intptr_t ParameterSlotFlag = 0x40;
+    static const intptr_t FlagBits = 7;
     
     class FatEntry {
         WTF_DEPRECATED_MAKE_STRUCT_FAST_ALLOCATED_WITH_HEAP_IDENTIFIER(FatEntry, SymbolTableEntryFatEntry);
@@ -334,6 +375,14 @@ private:
         intptr_t m_bits; // always has FatFlag set and exactly matches what the bits would have been if this wasn't fat.
 
         InlineWatchpointSet m_watchpoints { ClearWatchpoint };
+
+        // Set once, before m_watchpoints goes from ClearWatchpoint to IsWatched; never a cell.
+        EncodedJSValue m_inferredValue { JSValue::encode(JSValue()) };
+
+        static FatEntry* fromWatchpointSet(InlineWatchpointSet* set)
+        {
+            return std::bit_cast<FatEntry*>(std::bit_cast<char*>(set) - OBJECT_OFFSETOF(FatEntry, m_watchpoints));
+        }
     };
 
     bool isFat() const

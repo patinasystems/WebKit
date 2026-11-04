@@ -2319,7 +2319,9 @@ WEBKIT_SYMLINK_FILES(JavaScriptCore_CopyPrivateHeaders
 add_dependencies(JavaScriptCore_CopyPrivateHeaders Bytecodes JSCBuiltins JSCWebPreferenceOptions)
 
 # For static JSC builds, ensure headers are always copied as part of the default build
-if (ENABLE_STATIC_JSC)
+# The LLInt extractors read the private headers and JavaScriptCore links the LLInt, so a shared
+# JSC (no Visual Studio generator) copies them first too.
+if (ENABLE_STATIC_JSC OR NOT MSVC)
     add_dependencies(JavaScriptCore JavaScriptCore_CopyHeaders JavaScriptCore_CopyPrivateHeaders)
 endif ()
 
@@ -2329,9 +2331,15 @@ endif ()
 # CombinedDomains.json will be generated in both projects.
 # However, for static JSC builds, we cannot have this dependency as it creates
 # a cycle - instead, we ensure headers are copied by adding them to the default target.
-if(NOT INTERNAL_BUILD AND NOT ENABLE_STATIC_JSC)
+if(NOT INTERNAL_BUILD AND NOT ENABLE_STATIC_JSC AND MSVC)
     add_dependencies(JavaScriptCore_CopyPrivateHeaders JavaScriptCore)
 endif()
+
+# A shared JSC on Apple platforms links the Objective-C runtime itself (a static JSC leaves that
+# to the executable) and leaves the embedder hooks that Bun's additions declare weak undefined.
+if (APPLE AND NOT ENABLE_STATIC_JSC)
+    target_link_options(JavaScriptCore PRIVATE -lobjc -Wl,-U,_Bun__reportUnhandledError -Wl,-U,_Bun__thisThreadHasVM -Wl,-U,_Bun__analyzeTranspiledModule)
+endif ()
 
 target_include_directories(LowLevelInterpreterLib
     PRIVATE "$<TARGET_PROPERTY:JavaScriptCore,INCLUDE_DIRECTORIES>" "${JavaScriptCore_PRIVATE_FRAMEWORK_HEADERS_DIR}/JavaScriptCore")

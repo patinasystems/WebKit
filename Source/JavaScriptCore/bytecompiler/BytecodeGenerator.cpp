@@ -736,7 +736,12 @@ IGNORE_GCC_WARNINGS_END
             }
             
             ScopeOffset offset = functionSymbolTable->takeNextScopeOffset(NoLockingNecessary);
-            functionSymbolTable->set(NoLockingNecessary, name, SymbolTableEntry(VarOffset(offset)));
+            SymbolTableEntry entry { VarOffset(offset) };
+            // The put below runs in the prologue, before anything can read the slot (see
+            // SymbolTableEntry::isParameterSlot()). Generators and async functions resume on other code.
+            if (!isGeneratorOrAsyncFunctionBodyParseMode(parseMode) && !isGeneratorOrAsyncFunctionWrapperParseMode(parseMode))
+                entry.setIsParameterSlot();
+            functionSymbolTable->set(NoLockingNecessary, name, WTF::move(entry));
 IGNORE_GCC_WARNINGS_BEGIN("dangling-reference")
             const Identifier& ident =
                 static_cast<const BindingNode*>(parameters.at(i).first)->boundProperty();

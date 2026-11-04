@@ -1525,6 +1525,31 @@ public:
                     continue;
                 }
 
+                case ArithMod: {
+                    // x % 2^k with x >= 0 is x & (2^k - 1). Unrolled wrap-around indexing such as
+                    // (x + dx + W) % W with a constant W reaches here with x's range known.
+                    if (!node->isBinaryUseKind(Int32Use) || !node->child2()->isInt32Constant())
+                        break;
+                    int32_t divisor = node->child2()->asInt32();
+                    if (divisor <= 0 || !hasOneBitSet(divisor))
+                        break;
+                    auto range = rangeFor(node->child1().node());
+                    if (!range)
+                        break;
+                    auto [minBound, maxBound] = range.value();
+                    if (minBound.value < 0)
+                        break;
+
+                    executeNode(block->at(nodeIndex));
+                    pinRangeBounds(minBound);
+                    Node* mask = m_insertionSet.insertConstant(nodeIndex, node->origin, jsNumber(divisor - 1));
+                    node->setOpAndDefaultFlags(ArithBitAnd);
+                    node->clearFlags(NodeMustGenerate);
+                    node->child2() = Edge(mask, Int32Use);
+                    changed = true;
+                    continue;
+                }
+
                 case CheckInBounds: {
                     auto iter = m_relationships.find(node->child1().node());
                     if (iter == m_relationships.end())
@@ -1591,6 +1616,8 @@ public:
                 
                 executeNode(block->at(nodeIndex));
             }
+            // Constants for converted ArithMod nodes and AssertInBounds checks go in here.
+            m_insertionSet.execute(block);
         }
         
         return changed;
@@ -1892,7 +1919,21 @@ private:
             break;
         }
 
-        case ArithMod:
+        case ArithMod: {
+            // Int32 x % C keeps the sign of x and is smaller than |C| in magnitude. Like ArithBitAnd,
+            // only a constant divisor is used, so the relationship cannot go stale across fixpoint
+            // iterations. This constrains the output only, never the input (see the note below).
+            if (node->isBinaryUseKind(Int32Use) && node->child2()->isInt32Constant()) {
+                int32_t divisor = node->child2()->asInt32();
+                if (divisor != std::numeric_limits<int32_t>::min() && divisor) {
+                    int32_t magnitude = std::abs(divisor);
+                    setRelationship(Relationship(node, m_zero, Relationship::GreaterThan, -magnitude));
+                    setRelationship(Relationship(node, m_zero, Relationship::LessThan, magnitude));
+                }
+            }
+            break;
+        }
+
         case ArithDiv: {
             // Regardless of whether we have a check, these nodes cleared MustGenerate flag when input is Int32Use / Int52RepUse / DoubleRepUse.
             // If nobody is using the output (including MovHint), we do not need to perform checks and keep this node.

@@ -97,7 +97,16 @@ public:
         // Ratio of this count to total material node count
         double LEGACY_NODELETE ratio(uint32_t count) { return materialNodeCount ? static_cast<double>(count) / materialNodeCount : 0.0; }
 
-        uint32_t LEGACY_NODELETE generalUnrollSizeLimit() { return shouldFullyUnroll() ? Options::maxLoopUnrollingBodyNodeSize() : Options::maxPartialLoopUnrollingBodyNodeSize(); }
+        // A full unroll of a short loop may take a bigger body: what bounds code size is the unrolled
+        // total, which stays within the largest one the iteration and body limits allow together
+        // (a 3x3 neighbour loop's outer loop is a 3-trip loop over an already unrolled inner one).
+        uint32_t LEGACY_NODELETE generalUnrollSizeLimit()
+        {
+            if (!shouldFullyUnroll())
+                return Options::maxPartialLoopUnrollingBodyNodeSize();
+            uint32_t iterations = std::max<uint32_t>(iterationCount.value(), 1);
+            return std::max<uint32_t>(Options::maxLoopUnrollingBodyNodeSize(), Options::maxLoopUnrollingBodyNodeSize() * Options::maxLoopUnrollingIterationCount() / iterations);
+        }
 
         // Used for early bailout during loop node scanning; combines general and special-case size limits.
         uint32_t maxAllowedUnrollSize() { return std::max(generalUnrollSizeLimit(), Options::maxNumericHotLoopSize()); }
@@ -588,10 +597,21 @@ public:
         } else
             cloneCount = Options::maxPartialLoopUnrollingIterationCount() - 1;
 
+        // A fully unrolled innermost loop is straight-line code with a fixed trip count, so one trap
+        // check per execution of it is enough: the original body keeps its CheckTraps and the copies
+        // drop theirs. An enclosing loop or the function entry still checks.
+        bool dropClonedTrapChecks = data.shouldFullyUnroll() && data.loop->isInnerMostLoop();
+
         while (cloneCount--) {
             m_cloneHelper.clear();
             taken = m_cloneHelper.cloneBlock(header, [&](BasicBlock* block, BasicBlock* clone) {
                 ASSERT(clone == m_cloneHelper.blockClone(block));
+                if (dropClonedTrapChecks) {
+                    for (Node* node : *clone) {
+                        if (node->op() == CheckTraps)
+                            node->removeWithoutChecks();
+                    }
+                }
                 if (block != tail)
                     return false;
                 ASSERT(tail->terminal()->isBranch());

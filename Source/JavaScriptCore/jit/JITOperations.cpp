@@ -4700,7 +4700,7 @@ JSC_DEFINE_JIT_OPERATION(operationPutToScope, void, (JSGlobalObject* globalObjec
         JSLexicalEnvironment* environment = uncheckedDowncast<JSLexicalEnvironment>(jsScope);
         environment->variableAt(ScopeOffset(metadata.m_operand)).set(vm, environment, value);
         if (InlineWatchpointSet* set = metadata.m_watchpointSet)
-            set->touch(vm, "Executed op_put_scope<ResolvedClosureVar>");
+            SymbolTableEntry::notifyWrite(vm, set, value, "Executed op_put_scope<ResolvedClosureVar>");
         OPERATION_RETURN(scope);
     }
 

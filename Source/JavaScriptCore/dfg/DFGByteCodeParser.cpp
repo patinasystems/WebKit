@@ -1668,6 +1668,12 @@ private:
     };
     
     InlineStackEntry* m_inlineStackTop;
+
+    // The last op_resolve_scope that resolved a closure variable to a scope node that is not a
+    // constant, and the symbol table of the scopes that node can be (the metadata's). The
+    // op_get_from_scope that follows it folds a variable every such scope holds the same value of.
+    Node* m_lastResolvedClosureScope { nullptr };
+    SymbolTable* m_lastResolvedClosureScopeSymbolTable { nullptr };
     
     ICStatusContextStack m_icContextStack;
     
@@ -10728,6 +10734,8 @@ void ByteCodeParser::parseBlock(unsigned limit)
                 for (unsigned n = depth; n--;)
                     localBase = addToGraph(SkipScope, localBase);
                 set(bytecode.m_dst, localBase);
+                m_lastResolvedClosureScope = localBase;
+                m_lastResolvedClosureScopeSymbolTable = symbolTable;
                 break;
             }
             case UnresolvedProperty:
@@ -10910,6 +10918,13 @@ void ByteCodeParser::parseBlock(unsigned limit)
                     break;
                 }
 
+                if (scopeNode == m_lastResolvedClosureScope) {
+                    if (JSValue value = m_graph.tryGetInferredClosureVar(m_lastResolvedClosureScopeSymbolTable, ScopeOffset(operand))) {
+                        set(bytecode.m_dst, jsConstant(value));
+                        break;
+                    }
+                }
+
                 SpeculatedType prediction = SpecNone;
                 if (bytecode.m_getPutInfo.resolveType() == ResolvedClosureVar) {
                     // ResolvedClosureVar is not used normally. It is very special internal ResolveType, mainly used for generators and private fields.
@@ -11048,6 +11063,16 @@ void ByteCodeParser::parseBlock(unsigned limit)
             case ClosureVarWithVarInjectionChecks: {
                 Node* scopeNode = get(bytecode.m_scope);
                 Node* valueNode = get(bytecode.m_value);
+
+                // Every scope holds the same value of this parameter and code is folded to it: storing
+                // that value again changes nothing, so check for it instead of notifying the write.
+                JSValue inferred = watchpoints && resolveType == ResolvedClosureVar ? SymbolTableEntry::inferredValue(watchpoints) : JSValue();
+                if (inferred && !m_inlineStackTop->m_exitProfile.hasExitSite(m_currentIndex, BadConstantValue)) {
+                    m_graph.watchpoints().addLazily(*watchpoints);
+                    addToGraph(CheckIsConstant, OpInfo(m_graph.freeze(inferred)), valueNode);
+                    inferred = JSValue();
+                    watchpoints = nullptr;
+                }
 
                 addToGraph(PutClosureVar, OpInfo(operand), scopeNode, valueNode);
 

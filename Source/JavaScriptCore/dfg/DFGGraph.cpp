@@ -1490,6 +1490,28 @@ JSValue Graph::tryGetConstantClosureVar(JSValue base, ScopeOffset offset)
     return value;
 }
 
+JSValue Graph::tryGetInferredClosureVar(SymbolTable* symbolTable, ScopeOffset offset)
+{
+    if (m_plan.isUnlinked() || !symbolTable)
+        return JSValue();
+
+    JSValue value;
+    InlineWatchpointSet* set;
+    {
+        ConcurrentJSLocker locker(symbolTable->m_lock);
+        SymbolTableEntry* entry = symbolTable->entryFor(locker, offset);
+        if (!entry)
+            return JSValue();
+        value = entry->inferredValue();
+        if (!value)
+            return JSValue();
+        set = entry->watchpointSet();
+    }
+
+    watchpoints().addLazily(*set);
+    return value;
+}
+
 JSValue Graph::tryGetConstantClosureVar(const AbstractValue& value, ScopeOffset offset)
 {
     return tryGetConstantClosureVar(value.m_value, offset);

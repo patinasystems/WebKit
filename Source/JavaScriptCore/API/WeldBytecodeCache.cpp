@@ -22,6 +22,7 @@
 #include "SourceProvider.h"
 #include "UnlinkedFunctionExecutable.h"
 #include <cstdlib>
+#include <wtf/text/ASCIIFastPath.h>
 #include <wtf/text/ExternalStringImpl.h>
 #include <algorithm>
 #include <cstring>
@@ -154,10 +155,18 @@ enum WeldJscEncoding : uint32_t { WeldJscUTF8 = 0, WeldJscLatin1 = 1, WeldJscUTF
 namespace {
 
 // A graph's payload: a header, then one module payload per module, in the graph's order, each at a 16-byte aligned
-// offset. Every offset and length is a little-endian u32.
-//   'W' 'J' 'G' '1' | count | count x (offset, length) | payloads
+// offset. Every word is a little-endian u32. An entry's offset is aligned, so its low 4 bits are the module's flags
+// (graphASCII: its UTF-8 source is all ASCII, so a hit reads it in place as Latin-1 without scanning it; the payload is
+// keyed by the modules' content ids, so a hit's flags are for these very sources).
+//   'W' 'J' 'G' '1' | count | count x (offset | flags, length) | payloads
 constexpr uint32_t graphMagic = 0x3147'4a57; // "WJG1"
 constexpr size_t graphAlignment = 16;
+constexpr uint32_t graphASCII = 1;
+
+struct GraphEntry {
+    std::span<const uint8_t> payload;
+    uint32_t flags { 0 };
+};
 
 size_t graphHeaderSize(size_t count) { return roundUpToMultipleOf<graphAlignment>(8 + 8 * count); }
 
@@ -168,16 +177,20 @@ uint32_t readU32(std::span<const uint8_t> bytes, size_t at)
     return value;
 }
 
-// Module `index`'s payload in `graph`, or empty when `graph` is not a payload for `count` modules.
-std::span<const uint8_t> graphSlice(std::span<const uint8_t> graph, size_t count, size_t index)
+// Module `index`'s entry in `graph`: empty, with no flags, when `graph` is not a payload for `count` modules or the entry is out of bounds.
+GraphEntry graphEntry(std::span<const uint8_t> graph, size_t count, size_t index)
 {
     if (graph.size() < graphHeaderSize(count) || readU32(graph, 0) != graphMagic || readU32(graph, 4) != count)
         return { };
-    size_t offset = readU32(graph, 8 + 8 * index);
+    uint32_t word = readU32(graph, 8 + 8 * index);
+    size_t offset = word & ~uint32_t(graphAlignment - 1);
     size_t length = readU32(graph, 12 + 8 * index);
-    if (!length || offset % graphAlignment || offset > graph.size() || length > graph.size() - offset)
+    uint32_t flags = word & (graphAlignment - 1);
+    if (!length)
+        return { { }, offset ? 0 : flags };
+    if (offset > graph.size() || length > graph.size() - offset)
         return { };
-    return graph.subspan(offset, length);
+    return { graph.subspan(offset, length), flags };
 }
 
 // The embedder's release for a graph's payload, run once the last module's decoder is done with its slice.
@@ -200,18 +213,27 @@ private:
     void* m_context;
 };
 
-String sourceString(const WeldJscModule& module, ReleasePayload releaseSource)
+// The module's source as JSC keeps it, and whether it is ASCII UTF-8 (for the graph payload's flags). ASCII UTF-8 is
+// Latin-1: with a source context it is read in place; `knownASCII` (the payload's flag) skips the scan.
+std::pair<String, bool> sourceString(const WeldJscModule& module, ReleasePayload releaseSource, bool knownASCII)
 {
     void* context = module.sourceContext;
+    uint32_t encoding = module.encoding;
+    bool ascii = false;
+    if (encoding == WeldJscUTF8) {
+        ascii = knownASCII || charactersAreAllASCII(std::span(static_cast<const Latin1Character*>(module.source), module.length));
+        if (ascii)
+            encoding = WeldJscLatin1;
+    }
     if (context && releaseSource && module.length <= StringImpl::MaxLength) {
         auto release = [releaseSource](void* context, void*, unsigned) { releaseSource(context); };
-        if (module.encoding == WeldJscLatin1)
-            return String(ExternalStringImpl::create(std::span(static_cast<const Latin1Character*>(module.source), module.length), context, WTF::move(release)));
-        if (module.encoding == WeldJscUTF16)
-            return String(ExternalStringImpl::create(std::span(static_cast<const char16_t*>(module.source), module.length), context, WTF::move(release)));
+        if (encoding == WeldJscLatin1)
+            return { String(ExternalStringImpl::create(std::span(static_cast<const Latin1Character*>(module.source), module.length), context, WTF::move(release))), ascii };
+        if (encoding == WeldJscUTF16)
+            return { String(ExternalStringImpl::create(std::span(static_cast<const char16_t*>(module.source), module.length), context, WTF::move(release))), ascii };
     }
     String text;
-    switch (module.encoding) {
+    switch (encoding) {
     case WeldJscLatin1:
         text = String(std::span(static_cast<const Latin1Character*>(module.source), module.length));
         break;
@@ -223,12 +245,14 @@ String sourceString(const WeldJscModule& module, ReleasePayload releaseSource)
     }
     if (context && releaseSource)
         releaseSource(context);
-    return text;
+    return { WTF::move(text), ascii };
 }
 
 class Graph {
 public:
     Vector<Ref<WeldCachedProvider>> modules;
+    // Per module: graphASCII when its UTF-8 source is all ASCII (the payload's flags).
+    Vector<uint8_t> flags;
 
     // The graph's payload with what every module compiled so far, or 0 when no module compiled anything new.
     size_t commit(uint8_t** out)
@@ -252,7 +276,7 @@ public:
         for (size_t i = 0; i < count; ++i) {
             at = roundUpToMultipleOf<graphAlignment>(at);
             size_t length = modules[i]->size();
-            put(8 + 8 * i, length ? at : 0);
+            put(8 + 8 * i, (length ? at : 0) | flags[i]);
             put(12 + 8 * i, length);
             modules[i]->write(std::span(bytes + at, length));
             at += length;
@@ -342,12 +366,16 @@ extern "C" __attribute__((visibility("default"))) JSValueRef weld_jsc_eval_graph
     }
     std::span<const uint8_t> bytes(payload, payloadLength);
     auto* handle = graph ? new Graph : nullptr;
-    if (handle)
+    if (handle) {
         handle->modules.reserveInitialCapacity(count);
+        handle->flags.reserveInitialCapacity(count);
+    }
     for (size_t i = 0; i < count; ++i) {
         auto& module = modules[i];
-        auto provider = WeldCachedProvider::create(sourceString(module, releaseSource), String::fromUTF8(module.url),
-            graphSlice(bytes, count, i), CachePayload::Destructor([held = held.copyRef()](const void*) { }), module.hash & 0xff'ffff);
+        auto entry = graphEntry(bytes, count, i);
+        auto [text, ascii] = sourceString(module, releaseSource, entry.flags & graphASCII);
+        auto provider = WeldCachedProvider::create(text, String::fromUTF8(module.url), entry.payload,
+            CachePayload::Destructor([held = held.copyRef()](const void*) { }), module.hash & 0xff'ffff);
         NakedPtr<Exception> thrown;
         JSValue result = JSC::evaluate(globalObject, SourceCode(provider.copyRef()), JSValue(), thrown);
         if (thrown) {
@@ -356,8 +384,10 @@ extern "C" __attribute__((visibility("default"))) JSValueRef weld_jsc_eval_graph
         }
         results->putDirectIndex(globalObject, i, result);
         scope.clearException();
-        if (handle)
+        if (handle) {
             handle->modules.append(WTF::move(provider));
+            handle->flags.append(ascii ? graphASCII : 0);
+        }
     }
     if (graph)
         *graph = reinterpret_cast<WeldJscGraph*>(handle);

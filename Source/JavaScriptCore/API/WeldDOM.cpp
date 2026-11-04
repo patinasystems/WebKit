@@ -25,6 +25,7 @@
 #include "config.h"
 
 #include "APICast.h"
+#include "ArrayBuffer.h"
 #include "CCallHelpers.h"
 #include "DOMAttributeGetterSetter.h"
 #include "DOMJITCallDOMGetterSnippet.h"
@@ -167,6 +168,8 @@ public:
 
     void put(uint32_t slot, JSObject* object)
     {
+        if (!hasSlot(slot))
+            return;
         if (slot >= m_size) {
             uint32_t size = std::max<uint32_t>(64, m_size);
             while (size <= slot)
@@ -193,8 +196,14 @@ public:
         m_entries[slot] = nullptr;
     }
 
-    void setTypes(const uint8_t* types, uint32_t length)
+    // The node types by slot, read in place: the buffer is pinned (never detached) while named.
+    void setTypes(RefPtr<ArrayBuffer>&& buffer, const uint8_t* types, uint32_t length)
     {
+        if (buffer)
+            buffer->pin();
+        if (m_typesBuffer)
+            m_typesBuffer->unpin();
+        m_typesBuffer = WTF::move(buffer);
         m_types = types;
         m_typesLength = length;
     }
@@ -256,6 +265,9 @@ public:
     void* m_releaseContext;
     uint32_t m_tag;
     JSWeldDocument* m_cell { nullptr };
+    // `arm` named this table for the next construction: the marking constraint keeps its document.
+    bool m_armed { false };
+    RefPtr<ArrayBuffer> m_typesBuffer;
     Vector<std::pair<uint32_t, uint32_t>> m_owners;
 };
 
@@ -447,8 +459,11 @@ void addAllRoots(VM& vm, Visitor& visitor)
     for (auto& entry : allTables()) {
         if (entry.vm != vm.identifier().toUInt64())
             continue;
-        for (WeldDomTable* table : entry.tables)
+        for (WeldDomTable* table : entry.tables) {
+            if (table->m_armed && table->m_cell)
+                visitor.appendUnbarriered(table->m_cell);
             table->addRoots(visitor);
+        }
     }
 }
 
@@ -485,10 +500,13 @@ void unregisterTable(VM& vm, WeldDomTable* table)
 WeldDomTable::~WeldDomTable()
 {
     unregisterTable(m_vm, this);
+    if (m_typesBuffer)
+        m_typesBuffer->unpin();
     destroyEntries();
 }
 
-// What `arm` set for the next `NodeBase` construction on this thread.
+// What `arm` set for the next `NodeBase` construction on this thread. Its table is flagged
+// (`m_armed`), so the marking constraint keeps the document until the construction or a re-arm.
 struct Armed {
     WeldDomTable* table { nullptr };
     uint32_t slot { 0 };
@@ -736,6 +754,8 @@ JSC_DEFINE_HOST_FUNCTION(weldNodeBaseConstruct, (JSGlobalObject* globalObject, C
     JSObject* newTarget = asObject(callFrame->newTarget());
     Armed armed = s_armed;
     s_armed = { };
+    if (armed.table)
+        armed.table->m_armed = false;
     if (armed.table && armed.table->m_cell) {
         Structure* structure = InternalFunction::createSubclassStructure(globalObject, newTarget, armed.table->m_cell->m_nodeStructure.get());
         RETURN_IF_EXCEPTION(scope, { });
@@ -753,7 +773,11 @@ JSC_DEFINE_HOST_FUNCTION(weldArm, (JSGlobalObject*, CallFrame* callFrame))
 {
     JSWeldDocument* doc = documentArg(callFrame, 0);
     uint32_t slot = slotArg(callFrame, 1);
+    if (s_armed.table)
+        s_armed.table->m_armed = false;
     s_armed = doc && doc->table().hasSlot(slot) ? Armed { &doc->table(), slot, slotArg(callFrame, 2) } : Armed { };
+    if (s_armed.table)
+        s_armed.table->m_armed = true;
     return JSValue::encode(jsUndefined());
 }
 
@@ -804,9 +828,9 @@ JSC_DEFINE_HOST_FUNCTION(weldTypes, (JSGlobalObject* globalObject, CallFrame* ca
     if (!doc || !array)
         return JSValue::encode(jsBoolean(false));
     // A view's bytes move once, when a fast typed array is given an ArrayBuffer: do it now.
-    array->possiblySharedBuffer();
+    RefPtr<ArrayBuffer> buffer = array->possiblySharedBuffer();
     doc->m_types.set(vm, doc, array);
-    doc->table().setTypes(array->typedVector(), static_cast<uint32_t>(array->length()));
+    doc->table().setTypes(WTF::move(buffer), array->typedVector(), static_cast<uint32_t>(array->length()));
     return JSValue::encode(jsBoolean(true));
 }
 

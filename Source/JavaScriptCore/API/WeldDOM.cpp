@@ -43,6 +43,7 @@
 #include "SnippetParams.h"
 #include "WeakHandleOwner.h"
 #include "WeakSetInlines.h"
+#include <array>
 #include <wtf/FastMalloc.h>
 
 using namespace JSC;
@@ -81,6 +82,7 @@ public:
     WeldDomTable(VM& vm, const WeldDomLinks* links, void (*release)(void*), void* releaseContext, uint32_t tag)
         : m_vm(vm)
         , m_links(links)
+        , m_rustLinks(links)
         , m_release(release)
         , m_releaseContext(releaseContext)
         , m_tag(tag)
@@ -100,6 +102,46 @@ public:
     }
 
     bool hasSlot(uint32_t slot) const { return slot != kNone && (slot >> kPageShift) < m_links->count; }
+
+    // A page of NONE links, for a page the replay copy has none of.
+    static uint32_t* nonePage()
+    {
+        static const std::array<uint32_t, 6 * kPage> page = [] {
+            std::array<uint32_t, 6 * kPage> words;
+            words.fill(kNone);
+            return words;
+        }();
+        return const_cast<uint32_t*>(page.data());
+    }
+
+    // While a streaming parse replays (web-front's `Mirror.applyStream`), the getters read the
+    // mirror's scratch copy of the tree, not Rust's end state: `pages[k]` is page k's copy (null:
+    // none). It covers every page Rust has, so the inline reads still check nothing.
+    void beginReplay(Vector<std::pair<RefPtr<ArrayBuffer>, uint32_t*>>&& pages)
+    {
+        endReplay();
+        uint32_t count = std::max<uint32_t>(pages.size(), m_rustLinks->count);
+        m_replayPages.fill(nonePage(), count);
+        for (size_t k = 0; k < pages.size(); ++k) {
+            if (!pages[k].second)
+                continue;
+            pages[k].first->pin();
+            m_replayPages[k] = pages[k].second;
+            m_replayBuffers.append(WTF::move(pages[k].first));
+        }
+        m_replayLinks = { m_replayPages.span().data(), count, 0 };
+        m_links = &m_replayLinks;
+    }
+
+    void endReplay()
+    {
+        for (auto& buffer : m_replayBuffers)
+            buffer->unpin();
+        m_replayBuffers.clear();
+        m_links = m_rustLinks;
+        m_replayLinks = { nullptr, 0, 0 };
+        m_replayPages.clear();
+    }
 
     uint32_t link(unsigned column, uint32_t slot) const
     {
@@ -258,7 +300,12 @@ public:
     WeakImpl** m_entries { nullptr };
     uint32_t m_size { 0 };
     uint32_t m_collected { 0 };
+    // What the getters read: Rust's page table, or the replay copy's (`beginReplay`).
     const WeldDomLinks* m_links;
+    const WeldDomLinks* m_rustLinks;
+    WeldDomLinks m_replayLinks { nullptr, 0, 0 };
+    Vector<uint32_t*> m_replayPages;
+    Vector<RefPtr<ArrayBuffer>> m_replayBuffers;
     const uint8_t* m_types { nullptr };
     uint32_t m_typesLength { 0 };
     void (*m_release)(void*);
@@ -502,6 +549,7 @@ WeldDomTable::~WeldDomTable()
     unregisterTable(m_vm, this);
     if (m_typesBuffer)
         m_typesBuffer->unpin();
+    endReplay();
     destroyEntries();
 }
 
@@ -754,13 +802,17 @@ JSC_DEFINE_HOST_FUNCTION(weldNodeBaseConstruct, (JSGlobalObject* globalObject, C
     JSObject* newTarget = asObject(callFrame->newTarget());
     Armed armed = s_armed;
     s_armed = { };
+    // The document stays alive from here on through this frame (`doc`), not the flag: the
+    // structure lookup below can run script, which may arm again.
+    JSWeldDocument* doc = armed.table ? armed.table->m_cell : nullptr;
     if (armed.table)
         armed.table->m_armed = false;
-    if (armed.table && armed.table->m_cell) {
-        Structure* structure = InternalFunction::createSubclassStructure(globalObject, newTarget, armed.table->m_cell->m_nodeStructure.get());
+    if (doc) {
+        Structure* structure = InternalFunction::createSubclassStructure(globalObject, newTarget, doc->m_nodeStructure.get());
         RETURN_IF_EXCEPTION(scope, { });
-        JSWeldNode* node = JSWeldNode::create(vm, structure, armed.table, armed.slot, armed.gen);
-        armed.table->put(armed.slot, node);
+        JSWeldNode* node = JSWeldNode::create(vm, structure, &doc->table(), armed.slot, armed.gen);
+        doc->table().put(armed.slot, node);
+        ensureStillAliveHere(doc);
         return JSValue::encode(node);
     }
     Structure* structure = InternalFunction::createSubclassStructure(globalObject, newTarget, globalObject->objectStructureForObjectConstructor());
@@ -779,6 +831,42 @@ JSC_DEFINE_HOST_FUNCTION(weldArm, (JSGlobalObject*, CallFrame* callFrame))
     if (s_armed.table)
         s_armed.table->m_armed = true;
     return JSValue::encode(jsUndefined());
+}
+
+// replay(doc, pages | null): the getters read `pages` (Int32Arrays, the mirror's replay copy of
+// the link pages) until replay(doc, null).
+JSC_DEFINE_HOST_FUNCTION(weldReplay, (JSGlobalObject* globalObject, CallFrame* callFrame))
+{
+    VM& vm = globalObject->vm();
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    JSWeldDocument* doc = documentArg(callFrame, 0);
+    if (!doc)
+        return JSValue::encode(jsBoolean(false));
+    auto* array = dynamicDowncast<JSArray>(callFrame->argument(1));
+    if (!array) {
+        doc->table().endReplay();
+        return JSValue::encode(jsBoolean(true));
+    }
+    uint32_t length = array->length();
+    Vector<std::pair<RefPtr<ArrayBuffer>, uint32_t*>> pages;
+    pages.reserveInitialCapacity(length);
+    for (uint32_t k = 0; k < length; ++k) {
+        JSValue page = array->getIndex(globalObject, k);
+        RETURN_IF_EXCEPTION(scope, { });
+        auto* view = dynamicDowncast<JSInt32Array>(page);
+        if (!view || view->length() < 6 * kPage) {
+            pages.append({ nullptr, nullptr });
+            continue;
+        }
+        RefPtr<ArrayBuffer> buffer = view->possiblySharedBuffer();
+        if (!buffer) {
+            pages.append({ nullptr, nullptr });
+            continue;
+        }
+        pages.append({ WTF::move(buffer), reinterpret_cast<uint32_t*>(view->typedVector()) });
+    }
+    doc->table().beginReplay(WTF::move(pages));
+    return JSValue::encode(jsBoolean(true));
 }
 
 // install(prototype): the tree getters, on a node class's prototype.
@@ -944,6 +1032,7 @@ extern "C" __attribute__((visibility("default"))) JSValueRef weld_dom_bindings(J
     bindings->putDirect(vm, Identifier::fromString(vm, "NodeBase"_s), nodeBase);
     function("arm"_s, 3, weldArm);
     function("install"_s, 1, weldInstall);
+    function("replay"_s, 2, weldReplay);
     function("attach"_s, 2, weldAttach);
     function("types"_s, 2, weldTypes);
     function("get"_s, 2, weldGet);

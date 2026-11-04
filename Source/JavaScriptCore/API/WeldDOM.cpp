@@ -46,6 +46,7 @@
 #include "WeakSetInlines.h"
 #include <array>
 #include <wtf/FastMalloc.h>
+#include <atomic>
 #include <bit>
 
 using namespace JSC;
@@ -118,6 +119,7 @@ public:
         }
         fastFree(m_entries);
         fastFree(m_live);
+        fastFree(m_visited);
         m_rustLinks->changed = nullptr;
         m_rustLinks->changedContext = nullptr;
         if (m_release)
@@ -177,20 +179,62 @@ public:
 
     uint8_t type(uint32_t slot) const { return slot < m_typesLength ? m_types[slot] : 0; }
 
+    // The next node toward `slot`'s root: its parent, or for template contents their template.
+    uint32_t up(uint32_t slot) const
+    {
+        uint32_t p = link(Parent, slot);
+        return p != kNone ? p : ownerOf(slot);
+    }
+
     // The root of `slot`'s tree, through template contents to their template's tree.
     uint32_t root(uint32_t slot) const
     {
         uint32_t n = slot;
         for (unsigned steps = 0; steps < (1u << 26); ++steps) {
-            uint32_t p = link(Parent, n);
-            if (p == kNone) {
-                p = ownerOf(n);
-                if (p == kNone)
-                    return n;
-            }
+            uint32_t p = up(n);
+            if (p == kNone)
+                return n;
             n = p;
         }
         return n;
+    }
+
+    // `m_visited` holds for one stop of the world in one collection: the mutator, which moves
+    // nodes, has not run since (`mutatorExecutionVersion`), and the opaque roots are this
+    // collection's (`lastGCBoundaryTime`, its start while it runs).
+    uint64_t visitKey() const
+    {
+        uint64_t start = std::bit_cast<uint64_t>(m_vm.heap.lastGCBoundaryTime().secondsSinceEpoch().value());
+        return start ^ (m_vm.heap.mutatorExecutionVersion() * 0x9E3779B97F4A7C15ull);
+    }
+
+    // At a new stop: every slot Rust has, unvisited. Only the constraint, which runs alone, writes.
+    void beginVisit()
+    {
+        uint64_t key = visitKey();
+        if (m_visitedKey.load(std::memory_order_relaxed) == key)
+            return;
+        uint32_t words = (m_count << kPageShift) / 64;
+        if (words > m_visitedWords) {
+            fastFree(m_visited);
+            m_visited = static_cast<std::atomic<uint64_t>*>(fastZeroedMalloc(words * sizeof(uint64_t)));
+            m_visitedWords = words;
+        } else {
+            for (uint32_t w = 0; w < m_visitedWords; ++w)
+                m_visited[w].store(0, std::memory_order_relaxed);
+        }
+        m_visitedKey.store(key, std::memory_order_release);
+    }
+
+    bool visited(uint32_t slot) const
+    {
+        return slot / 64 < m_visitedWords && (m_visited[slot / 64].load(std::memory_order_acquire) >> (slot % 64)) & 1;
+    }
+
+    void setVisited(uint32_t slot)
+    {
+        if (slot / 64 < m_visitedWords)
+            m_visited[slot / 64].fetch_or(uint64_t(1) << (slot % 64), std::memory_order_release);
     }
 
     void* rootKey(uint32_t slot) const
@@ -295,18 +339,41 @@ public:
     }
 
     // The marking constraint: every marked wrapper's tree root is an opaque root. It visits the
-    // slots with an entry (`m_live`), not every slot the document ever had.
+    // slots with an entry (`m_live`), not every slot the document ever had. A walk stops at a node
+    // an earlier walk of this stop already went through (`m_visited`), whose root is added, so
+    // one stop walks each node at most once: O(nodes), not O(wrappers x depth), and the
+    // constraint's later runs in the same stop skip the wrappers it already did.
     template<typename Visitor>
     void addRoots(Visitor& visitor)
     {
+        beginVisit();
         for (uint32_t word = 0; word < m_size / 64; ++word) {
             for (uint64_t bits = m_live[word]; bits; bits &= bits - 1) {
                 uint32_t i = word * 64 + std::countr_zero(bits);
+                if (visited(i))
+                    continue;
                 WeakImpl* impl = m_entries[i];
                 if (impl->state() != WeakImpl::Live)
                     continue;
-                if (visitor.isMarked(impl->jsValue().asCell()))
-                    visitor.addOpaqueRoot(rootKey(i));
+                if (!visitor.isMarked(impl->jsValue().asCell()))
+                    continue;
+                // Up to the root, or to a node whose root an earlier walk added.
+                uint32_t stop = i;
+                for (unsigned steps = 0; !visited(stop) && steps < (1u << 26); ++steps) {
+                    uint32_t p = up(stop);
+                    if (p == kNone) {
+                        visitor.addOpaqueRoot(rootKey(stop));
+                        break;
+                    }
+                    stop = p;
+                }
+                // Then mark the path, the root's addition first (release: a reader that sees a
+                // bit sees the root).
+                for (uint32_t n = i; ; n = up(n)) {
+                    setVisited(n);
+                    if (n == stop)
+                        break;
+                }
             }
         }
     }
@@ -318,7 +385,17 @@ public:
             return false;
         if (reason) [[unlikely]]
             *reason = "Its weld-dom tree is reachable"_s;
-        return visitor.containsOpaqueRoot(rootKey(static_cast<uint32_t>(reinterpret_cast<uintptr_t>(context))));
+        uint32_t slot = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(context));
+        // A node on a path `addRoots` walked in this stop has its root added.
+        if (m_visitedKey.load(std::memory_order_acquire) == visitKey()) {
+            uint32_t n = slot;
+            for (unsigned steps = 0; n != kNone && steps < (1u << 26); ++steps, n = up(n)) {
+                if (visited(n))
+                    return true;
+            }
+            return false;
+        }
+        return visitor.containsOpaqueRoot(rootKey(slot));
     }
 
     void finalize(JSC::Handle<JSC::Unknown> handle, void* context) final
@@ -339,6 +416,11 @@ public:
     WeakImpl** m_entries { nullptr };
     // One bit a slot: whether `m_entries` has an entry there (the constraint's scan).
     uint64_t* m_live { nullptr };
+    // One stop's walk to the roots (`addRoots`): a set bit says the slot's root is an opaque root.
+    // One bit for every slot Rust has; `m_visitedKey` names the stop it holds for (`visitKey`).
+    std::atomic<uint64_t>* m_visited { nullptr };
+    uint32_t m_visitedWords { 0 };
+    std::atomic<uint64_t> m_visitedKey { 0 };
     uint32_t m_size { 0 };
     uint32_t m_collected { 0 };
     // What the getters read: Rust's pages (kept current by `linksChanged`), or the replay copy's

@@ -597,7 +597,10 @@ public:
 
     static JSWeldDomBindings* create(VM& vm, JSGlobalObject* globalObject)
     {
-        auto* object = new (NotNull, allocateCell<JSWeldDomBindings>(vm)) JSWeldDomBindings(vm, createStructure(vm, globalObject, globalObject->objectPrototype()));
+        // The structure first: allocating it can collect, and a collection must not find this cell before its
+        // constructor gives it a structure (C++ allocates the cell before it evaluates the constructor's arguments).
+        Structure* structure = createStructure(vm, globalObject, globalObject->objectPrototype());
+        auto* object = new (NotNull, allocateCell<JSWeldDomBindings>(vm)) JSWeldDomBindings(vm, structure);
         object->finishCreation(vm);
         object->m_nodeStructure.set(vm, object, JSWeldNode::createStructure(vm, globalObject, globalObject->objectPrototype()));
         object->m_documentStructure.set(vm, object, JSWeldDocument::createStructure(vm, globalObject, jsNull()));

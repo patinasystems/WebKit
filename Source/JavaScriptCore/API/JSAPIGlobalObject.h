@@ -55,6 +55,14 @@ public:
 
     JSValue loadAndEvaluateJSScriptModule(const JSLockHolder&, JSScript *);
 
+    DECLARE_VISIT_CHILDREN;
+
+    // Weld (WeldModuleLoader.cpp, weld_jsc_module_hooks): the functions `import()` and `import.meta.resolve` call in
+    // this global, or null.
+    JSObject* weldImportModule() const { return m_weldImportModule.get(); }
+    JSObject* weldResolveModule() const { return m_weldResolveModule.get(); }
+    void setWeldModuleHooks(VM&, JSObject* importModule, JSObject* resolveModule);
+
 private:
     static const GlobalObjectMethodTable* globalObjectMethodTable();
     JSAPIGlobalObject(VM&, Structure*);
@@ -64,6 +72,9 @@ private:
     static JSPromise* moduleLoaderFetch(JSGlobalObject*, JSModuleLoader*, JSValue, const String&, RefPtr<ScriptFetchParameters>, RefPtr<ScriptFetcher>);
     static JSObject* moduleLoaderCreateImportMetaProperties(JSGlobalObject*, JSModuleLoader*, JSValue, JSModuleRecord*, RefPtr<ScriptFetcher>);
     static JSValue moduleLoaderEvaluate(JSGlobalObject*, JSModuleLoader*, JSValue, JSValue, RefPtr<ScriptFetcher>, JSValue, JSValue);
+
+    WriteBarrier<JSObject> m_weldImportModule;
+    WriteBarrier<JSObject> m_weldResolveModule;
 };
 
 }

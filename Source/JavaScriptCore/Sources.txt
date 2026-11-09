@@ -41,6 +41,7 @@ API/WeldBytecodeCache.cpp @no-unify
 API/WeldDOM.cpp @no-unify
 API/WeldHostClass.cpp @no-unify
 API/WeldMemory.cpp @no-unify
+API/WeldModuleLoader.cpp @no-unify
 API/JSStringRef.cpp
 API/JSValueRef.cpp
 API/JSWeakObjectMapRefPrivate.cpp

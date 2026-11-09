@@ -28,6 +28,7 @@
 
 #include "GlobalObjectMethodTable.h"
 #include "JSCellInlines.h"
+#include "JSCInlines.h"
 #include "StructureCreateInlines.h"
 
 namespace JSC {
@@ -44,10 +45,10 @@ const GlobalObjectMethodTable* JSAPIGlobalObject::globalObjectMethodTable()
         &javaScriptRuntimeFlags,
         &shouldInterruptScriptBeforeTimeout,
         nullptr, // moduleTypeIsAllowed
-        nullptr, // moduleLoaderImportModule
-        nullptr, // moduleLoaderResolve
-        nullptr, // moduleLoaderFetch
-        nullptr, // moduleLoaderCreateImportMetaProperties
+        &moduleLoaderImportModule, // Weld: WeldModuleLoader.cpp
+        nullptr, // moduleLoaderResolve: a module record's requests are the keys of the modules they load (WeldModuleLoader.cpp)
+        nullptr, // moduleLoaderFetch: modules are provided before they are loaded (weld_jsc_module_provide)
+        &moduleLoaderCreateImportMetaProperties, // Weld: WeldModuleLoader.cpp
         nullptr, // moduleLoaderEvaluate
         &promiseRejectionTracker,
         &reportUncaughtExceptionAtEventLoop,
@@ -75,6 +76,24 @@ void JSAPIGlobalObject::reportUncaughtExceptionAtEventLoop(JSGlobalObject* globa
 JSAPIGlobalObject::JSAPIGlobalObject(VM& vm, Structure* structure)
     : Base(vm, structure, globalObjectMethodTable())
 {
+}
+
+template<typename Visitor>
+void JSAPIGlobalObject::visitChildrenImpl(JSCell* cell, Visitor& visitor)
+{
+    auto* thisObject = uncheckedDowncast<JSAPIGlobalObject>(cell);
+    ASSERT_GC_OBJECT_INHERITS(thisObject, info());
+    Base::visitChildren(thisObject, visitor);
+    visitor.append(thisObject->m_weldImportModule);
+    visitor.append(thisObject->m_weldResolveModule);
+}
+
+DEFINE_VISIT_CHILDREN(JSAPIGlobalObject);
+
+void JSAPIGlobalObject::setWeldModuleHooks(VM& vm, JSObject* importModule, JSObject* resolveModule)
+{
+    m_weldImportModule.setMayBeNull(vm, this, importModule);
+    m_weldResolveModule.setMayBeNull(vm, this, resolveModule);
 }
 
 JSAPIGlobalObject* JSAPIGlobalObject::create(VM& vm, Structure* structure)

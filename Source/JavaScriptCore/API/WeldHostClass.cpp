@@ -614,7 +614,8 @@ WELD_EXPORT JSObjectRef weld_jsc_function(JSContextRef ctx, const char* name, si
         const JSValueRef* args = argc ? reinterpret_cast<const JSValueRef*>(callFrame->addressOfArgumentsStart()) : nullptr;
         JSValueRef result = function.call(toRef(globalObject), toRef(uncheckedDowncast<JSObject>(thisValue)), args, argc);
         RETURN_IF_EXCEPTION(scope, { });
-        return JSValue::encode(result ? toJS(result) : jsUndefined());
+        // Null without an exception is JS null, as the C API reads a callback's null.
+        return JSValue::encode(result ? toJS(result) : jsNull());
     });
     return toRef(object);
 }
@@ -739,13 +740,17 @@ WELD_EXPORT int weld_host_string_span(JSContextRef ctx, JSValueRef value, WeldSt
     if (!v || !v.isString() || !out)
         return 0;
     auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
+    // An exception the caller left pending stays pending: only one this read raises is cleared.
+    bool pending = !!scope.exception();
     // A copy of the String (a reference, not the characters): the JSString keeps the same storage, resolved.
     String string = v.toWTFString(globalObject);
-    if (scope.exception()) [[unlikely]] {
+    if (!pending && scope.exception()) [[unlikely]] {
         scope.clearException();
         return 0;
     }
     StringImpl* impl = string.impl();
+    if (!impl && asString(v)->length()) [[unlikely]]
+        return 0;
     if (!impl) {
         *out = { "", 0, 1 };
         return 1;

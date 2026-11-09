@@ -58,13 +58,19 @@ extern "C" {
 // the document's life. `count` never shrinks, and a wrapper is only made for a slot below it, so
 // the inline reads check neither. `changed` and `changedContext` are the fork's: the table sets them
 // when it takes the links and clears them before it releases them, and Rust calls `changed` after
-// each write of `pages` or `count`, so the table reads its own copy of both (one load less a read).
+// each write of `pages`, `count` or `live`, so the table reads its own copy of them (one load less a read).
+// `live` is one bit a slot, set while the table has a wrapper for the slot (`put`) and cleared when it
+// is dropped or collected (`clear`), with plain stores: Rust reads it (its detached-tree sweep) and
+// never writes a bit. Rust owns it and grows it with `count` (`liveWords`, at least kPage / 64 for
+// each page, old bits kept), so every slot `hasSlot` admits has a bit; the table zeroes it before
+// it releases the links.
 struct WeldDomLinks {
     uint32_t* const* pages;
     uint32_t count;
-    uint32_t reserved;
+    uint32_t liveWords;
     void (*changed)(void*);
     void* changedContext;
+    uint64_t* live;
 };
 }
 
@@ -95,15 +101,19 @@ public:
         , m_releaseContext(releaseContext)
         , m_tag(tag)
     {
+        m_live = links->live;
+        m_liveWords = links->liveWords;
         m_rustLinks->changedContext = this;
         m_rustLinks->changed = &linksChanged;
     }
 
-    // Rust wrote `pages` or `count` (a page was added or released): read them again, unless a
-    // replay's copy is what the getters read.
+    // Rust wrote `pages`, `count` or `live` (a page was added or released): read them again; the
+    // pages only when no replay's copy is what the getters read.
     static void linksChanged(void* context)
     {
         auto* table = static_cast<WeldDomTable*>(context);
+        table->m_live = table->m_rustLinks->live;
+        table->m_liveWords = table->m_rustLinks->liveWords;
         if (!table->m_replaying) {
             table->m_pages = table->m_rustLinks->pages;
             table->m_count = table->m_rustLinks->count;
@@ -118,7 +128,9 @@ public:
                 WeakSet::deallocate(m_entries[i]);
         }
         fastFree(m_entries);
-        fastFree(m_live);
+        // Rust's bits outlive the table: a dead table has no wrappers.
+        if (m_live)
+            memset(m_live, 0, m_liveWords * sizeof(uint64_t));
         fastFree(m_visited);
         m_rustLinks->changed = nullptr;
         m_rustLinks->changedContext = nullptr;
@@ -279,22 +291,19 @@ public:
 
     void put(uint32_t slot, JSObject* object)
     {
-        if (!hasSlot(slot))
+        // A replay can name pages Rust does not have yet (`beginReplay` covers the larger count);
+        // a slot past Rust's bits gets no entry, as a slot past every page does.
+        if (!hasSlot(slot) || slot / 64 >= m_liveWords)
             return;
         if (slot >= m_size) {
             uint32_t size = std::max<uint32_t>(64, m_size);
             while (size <= slot)
                 size *= 2;
             auto* entries = static_cast<WeakImpl**>(fastZeroedMalloc(size * sizeof(WeakImpl*)));
-            auto* live = static_cast<uint64_t*>(fastZeroedMalloc(size / 64 * sizeof(uint64_t)));
-            if (m_size) {
+            if (m_size)
                 memcpy(entries, m_entries, m_size * sizeof(WeakImpl*));
-                memcpy(live, m_live, m_size / 64 * sizeof(uint64_t));
-            }
             fastFree(m_entries);
-            fastFree(m_live);
             m_entries = entries;
-            m_live = live;
             m_size = size;
         }
         if (m_entries[slot])
@@ -339,7 +348,7 @@ public:
     }
 
     // The marking constraint: every marked wrapper's tree root is an opaque root. It visits the
-    // slots with an entry (`m_live`), not every slot the document ever had. A walk stops at a node
+    // slots with an entry (`m_live`, Rust's bits), not every slot the document ever had. A walk stops at a node
     // an earlier walk of this stop already went through (`m_visited`), whose root is added, so
     // one stop walks each node at most once: O(nodes), not O(wrappers x depth), and the
     // constraint's later runs in the same stop skip the wrappers it already did.
@@ -347,7 +356,8 @@ public:
     void addRoots(Visitor& visitor)
     {
         beginVisit();
-        for (uint32_t word = 0; word < m_size / 64; ++word) {
+        uint32_t words = std::min(m_size / 64, m_liveWords);
+        for (uint32_t word = 0; word < words; ++word) {
             for (uint64_t bits = m_live[word]; bits; bits &= bits - 1) {
                 uint32_t i = word * 64 + std::countr_zero(bits);
                 if (visited(i))
@@ -414,8 +424,10 @@ public:
 
     VM& m_vm;
     WeakImpl** m_entries { nullptr };
-    // One bit a slot: whether `m_entries` has an entry there (the constraint's scan).
+    // One bit a slot: whether `m_entries` has an entry there (the constraint's scan, and Rust's
+    // sweep). Rust's memory (WeldDomLinks::live), `m_liveWords` words, kept current by `linksChanged`.
     uint64_t* m_live { nullptr };
+    uint32_t m_liveWords { 0 };
     // One stop's walk to the roots (`addRoots`): a set bit says the slot's root is an opaque root.
     // One bit for every slot Rust has; `m_visitedKey` names the stop it holds for (`visitKey`).
     std::atomic<uint64_t>* m_visited { nullptr };

@@ -1,14 +1,19 @@
-// Weld glue (patinasystems/WebKit, API/Weld*): memory back to the OS after a realm closes, and length-counted Latin-1
-// strings, over a C ABI weld-jsc calls (Kitchen lib/Weld/crates/jsc/src/sys.rs).
+// Weld glue (patinasystems/WebKit, API/Weld*): memory back to the OS after a realm closes, length-counted Latin-1
+// strings and heap snapshots, over a C ABI weld-jsc calls (Kitchen lib/Weld/crates/jsc/src/sys.rs).
 #include "config.h"
 
 #include "APICast.h"
+#include "DeferGCInlines.h"
 #include "Heap.h"
+#include "HeapProfiler.h"
+#include "HeapSnapshotBuilder.h"
 #include "InitializeThreading.h"
 #include "JSCInlines.h"
 #include "OpaqueJSString.h"
 #include "SourceProviderCache.h"
+#include <stdio.h>
 #include <wtf/FastMalloc.h>
+#include <wtf/text/CString.h>
 
 using namespace JSC;
 
@@ -42,4 +47,34 @@ extern "C" __attribute__((visibility("default"))) JSStringRef weld_jsc_string_la
 {
     JSC::initialize();
     return &OpaqueJSString::create(std::span { reinterpret_cast<const Latin1Character*>(chars), length }).leakRef();
+}
+
+// A GC-debugging heap snapshot of `group`'s VM written to `path`: JSC's JSON (as jsc's
+// generateHeapSnapshotForGCDebugging makes), every live cell with its edges, labels and, for roots, why each is a root,
+// so a tool can name the path that keeps a cell alive. It runs a full collection. Returns the bytes written, or 0 when
+// the snapshot overflowed or the file could not be written. Not under JS.
+extern "C" __attribute__((visibility("default"))) size_t weld_jsc_heap_snapshot(JSContextGroupRef group, const char* path)
+{
+    VM& vm = *toJS(group);
+    JSLockHolder lock(vm);
+    if (vm.entryScope)
+        return 0;
+    String json;
+    {
+        DeferGCForAWhile deferGC(vm);
+        HeapSnapshotBuilder builder(vm.ensureHeapProfiler(), HeapSnapshotBuilder::SnapshotType::GCDebuggingSnapshot);
+        builder.buildSnapshot();
+        if (builder.hasOverflowed())
+            return 0;
+        json = builder.json();
+    }
+    vm.ensureHeapProfiler().clearSnapshots();
+    CString utf8 = json.utf8();
+    FILE* file = fopen(path, "wb");
+    if (!file)
+        return 0;
+    size_t written = fwrite(utf8.data(), 1, utf8.length(), file);
+    if (fclose(file) || written != utf8.length())
+        return 0;
+    return written;
 }

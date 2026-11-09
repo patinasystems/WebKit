@@ -632,7 +632,7 @@ static void overrideDefaults()
     Options::worklistFTLLoadWeight() = 20;
 #endif
 
-#if PLATFORM(MAC) && CPU(ARM64)
+#if (PLATFORM(MAC) || OS(MACOS)) && CPU(ARM64)
     // JIT compilation can contribute to thermal load on Apple silicon Macs with few fast cores.
     constexpr unsigned maxPerformanceCoresForThresholdScaling = 2;
     if (numberOfSuperAndPerformanceCores() <= maxPerformanceCoresForThresholdScaling) {
@@ -648,6 +648,17 @@ static void overrideDefaults()
     // On iOS and conditionally Linux, we control heap growth using process memory footprint. Therefore these values can be agressive.
     Options::smallHeapRAMFraction() = 0.8;
     Options::mediumHeapRAMFraction() = 0.9;
+#endif
+
+#if OS(MACOS) && !PLATFORM(MAC)
+    // A port other than WebKit's Mac port on macOS (Weld's JSCOnly build): WebKit's Mac defaults, which
+    // Options.h and the block above key to PLATFORM(MAC), and the heap fractions WebKit ships on the Mac
+    // (Bun's tree turns on the memory footprint API for Darwin, which raises them to 0.8 and 0.9).
+    Options::quickDFGTierUpThresholdFactor() = 0.15;
+    Options::relaxedProfileCoverageFactorForQuickDFGTierUp() = 0.85;
+    Options::quickFTLTierUpThresholdFactor() = 0.15;
+    Options::smallHeapRAMFraction() = 0.25;
+    Options::mediumHeapRAMFraction() = 0.5;
 #endif
 
 #if !ENABLE(SIGNAL_BASED_VM_TRAPS)

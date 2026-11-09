@@ -4,8 +4,10 @@
 
 #include "APICast.h"
 #include "Heap.h"
+#include "InitializeThreading.h"
 #include "JSCInlines.h"
 #include "OpaqueJSString.h"
+#include "SourceProviderCache.h"
 #include <wtf/FastMalloc.h>
 
 using namespace JSC;

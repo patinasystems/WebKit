@@ -771,3 +771,27 @@ WELD_EXPORT int weld_host_bytes(JSContextRef ctx, JSValueRef value, uint8_t** pt
     }
     return 0;
 }
+
+// ToNumber(value) into `out`; 0 with the exception pending when it throws (return null from the member to pass it on).
+WELD_EXPORT int weld_host_to_number(JSContextRef ctx, JSValueRef value, double* out)
+{
+    JSGlobalObject* globalObject = toJS(ctx);
+    VM& vm = globalObject->vm();
+    JSLockHolder lock(vm);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    double number = (value ? toJS(value) : jsUndefined()).toNumber(globalObject);
+    RETURN_IF_EXCEPTION(scope, 0);
+    *out = number;
+    return 1;
+}
+
+// Throws `value` itself (an exception the C API caught, say); returns null, the value a member returns to throw.
+WELD_EXPORT JSValueRef weld_host_rethrow(JSContextRef ctx, JSValueRef value)
+{
+    JSGlobalObject* globalObject = toJS(ctx);
+    VM& vm = globalObject->vm();
+    JSLockHolder lock(vm);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    throwException(globalObject, scope, value ? toJS(value) : jsUndefined());
+    return nullptr;
+}

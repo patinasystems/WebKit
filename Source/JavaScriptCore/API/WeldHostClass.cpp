@@ -17,6 +17,11 @@
 // - JSWeldHostConstructor: the class's constructor function (InternalFunction): `new Path2D()` calls the spec's
 //   `construct`, which allocates the slot in Rust.
 // - weld_host_bytes: a typed array's or ArrayBuffer's bytes in place.
+// - weld_jsc_function: a plain host function (weld-jsc's `Runtime::function`) as a JSNativeStdFunction, so a call is a
+//   native call with the arguments in place. The C API's callback objects drop the API lock around every callback
+//   (JSLock::DropAllLocks), so each C API call the callback makes takes it again from nothing; here the lock stays
+//   held, as WebKit's own bindings hold it. Its data's finalizer runs when the function is destroyed (the sweeper or
+//   VM teardown, on the mutator thread).
 //
 // 64-bit only (CPU(ADDRESS64)), as weld-jsc is.
 #include "config.h"
@@ -94,6 +99,9 @@ typedef struct WeldHostClassSpec {
     uint32_t reserved;
     JSValueRef parent;
 } WeldHostClassSpec;
+
+typedef JSValueRef (*WeldJscFunctionFn)(JSContextRef ctx, JSObjectRef thisObject, const JSValueRef* args, size_t argc, void* data);
+typedef void (*WeldJscFunctionFinalize)(void* data);
 
 typedef struct WeldStringSpan {
     const void* chars;
@@ -415,6 +423,36 @@ NativeStdFunction memberStub(Ref<WeldHostData>&& data, WeldHostFn fn, unsigned a
     };
 }
 
+// A host function's Rust entry and data; the finalizer runs once, when the function (its only owner) is destroyed.
+class WeldFunctionData {
+    WTF_MAKE_NONCOPYABLE(WeldFunctionData);
+public:
+    WeldFunctionData(WeldJscFunctionFn fn, void* data, WeldJscFunctionFinalize finalize)
+        : m_fn(fn)
+        , m_data(data)
+        , m_finalize(finalize)
+    {
+    }
+    WeldFunctionData(WeldFunctionData&& other)
+        : m_fn(other.m_fn)
+        , m_data(other.m_data)
+        , m_finalize(std::exchange(other.m_finalize, nullptr))
+    {
+    }
+    ~WeldFunctionData()
+    {
+        if (m_finalize)
+            m_finalize(m_data);
+    }
+
+    JSValueRef call(JSContextRef ctx, JSObjectRef thisObject, const JSValueRef* args, size_t argc) const { return m_fn(ctx, thisObject, args, argc, m_data); }
+
+private:
+    WeldJscFunctionFn m_fn;
+    void* m_data;
+    WeldJscFunctionFinalize m_finalize;
+};
+
 Identifier memberIdentifier(VM& vm, const char* name)
 {
     if (!strcmp(name, "@@iterator"))
@@ -552,6 +590,33 @@ WELD_EXPORT JSValueRef weld_host_class(JSContextRef ctx, const WeldHostClassSpec
         prototype->putDirectAccessor(globalObject, id, getterSetter, PropertyAttribute::Accessor | enumerable);
     }
     return toRef(globalObject, cls);
+}
+
+// A host function in ctx's realm: `fn(ctx, this, args, argc, data)` with `this` as the C API gives it (ToThis, sloppy)
+// and the arguments in place. It returns the result, or null to throw what it left pending (weld_host_rethrow,
+// weld_host_throw); null with nothing pending is undefined. `finalize(data)` runs when the function is destroyed, also
+// when this returns null. `name` is UTF-8 (null: "").
+WELD_EXPORT JSObjectRef weld_jsc_function(JSContextRef ctx, const char* name, size_t nameLength, unsigned length, WeldJscFunctionFn fn, void* data, WeldJscFunctionFinalize finalize)
+{
+    WeldFunctionData function { fn, data, finalize };
+    if (!ctx || !fn)
+        return nullptr;
+    JSGlobalObject* globalObject = toJS(ctx);
+    VM& vm = globalObject->vm();
+    JSLockHolder lock(vm);
+    String functionName = name && nameLength ? String::fromUTF8(std::span { reinterpret_cast<const char8_t*>(name), nameLength }) : emptyString();
+    auto* object = JSNativeStdFunction::create(vm, globalObject, length, functionName, [function = WTF::move(function)](JSGlobalObject* globalObject, CallFrame* callFrame) -> EncodedJSValue {
+        VM& vm = globalObject->vm();
+        auto scope = DECLARE_THROW_SCOPE(vm);
+        JSValue thisValue = callFrame->thisValue().toThis(globalObject, ECMAMode::sloppy());
+        RETURN_IF_EXCEPTION(scope, { });
+        size_t argc = callFrame->argumentCount();
+        const JSValueRef* args = argc ? reinterpret_cast<const JSValueRef*>(callFrame->addressOfArgumentsStart()) : nullptr;
+        JSValueRef result = function.call(toRef(globalObject), toRef(uncheckedDowncast<JSObject>(thisValue)), args, argc);
+        RETURN_IF_EXCEPTION(scope, { });
+        return JSValue::encode(result ? toJS(result) : jsUndefined());
+    });
+    return toRef(object);
 }
 
 // The class's constructor function (put it where the interface goes).

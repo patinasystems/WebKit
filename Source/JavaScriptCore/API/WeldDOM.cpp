@@ -1207,3 +1207,19 @@ extern "C" __attribute__((visibility("default"))) JSValueRef weld_dom_document(J
     registerTable(vm, raw);
     return toRef(globalObject, doc);
 }
+
+// A native node wrapper's (slot, gen), and its document as Rust named it (weld_dom_document's `releaseContext`) when
+// `document` is not null. 0 when `value` is not a node wrapper (an ordinary object, or a document's other values).
+extern "C" __attribute__((visibility("default"))) int weld_dom_slot_of(JSContextRef ctx, JSValueRef value, uint32_t* slot, uint32_t* gen, void** document)
+{
+    JSGlobalObject* globalObject = toJS(ctx);
+    JSLockHolder lock(globalObject->vm());
+    auto* node = value ? dynamicDowncast<JSWeldNode>(toJS(globalObject, value)) : nullptr;
+    if (!node || !node->table())
+        return 0;
+    *slot = node->slot();
+    *gen = node->native().gen;
+    if (document)
+        *document = node->table()->m_releaseContext;
+    return 1;
+}

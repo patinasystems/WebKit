@@ -83,11 +83,11 @@ constexpr size_t exportWords = 6;
 
 class Analysis {
 public:
-    // Null when `bytes` is not a well-formed analysis for `requestCount` requests.
+    // Null when `bytes` is not a well-formed analysis. The names follow the words unpadded: any length.
     static std::optional<Analysis> read(std::span<const uint8_t> bytes)
     {
         Analysis a(bytes);
-        if (bytes.size() < headerWords * 4 || bytes.size() % 4)
+        if (bytes.size() < headerWords * 4)
             return std::nullopt;
         a.m_flags = a.word(0);
         a.m_requestCount = a.word(1);

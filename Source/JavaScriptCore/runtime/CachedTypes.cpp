@@ -1520,13 +1520,10 @@ void Decoder::setHandleForTDZEnvironment(CompactTDZEnvironment* environment, con
 
 void Decoder::addLeafExecutable(const UnlinkedFunctionExecutable* executable, ptrdiff_t offset)
 {
-#if USE(BUN_JSC_ADDITIONS)
-    // Only CachedBytecode::addFunctionUpdate reads this map, and Bun never calls it.
-    UNUSED_PARAM(executable);
-    UNUSED_PARAM(offset);
-#else
-    m_cachedBytecode->leafExecutables().add(executable, offset);
-#endif
+    // CachedBytecode::addFunctionUpdate reads this map: a function first compiled after its payload was decoded is
+    // appended to that payload (an embedder's commit), so a payload keeps growing across processes, not only in the
+    // process that wrote it. `set`, not `add`: an executable decoded at the address of a collected one names its own slot.
+    m_cachedBytecode->leafExecutables().set(executable, offset);
 }
 
 template<typename Functor>

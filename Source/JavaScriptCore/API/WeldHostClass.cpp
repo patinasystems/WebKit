@@ -24,6 +24,7 @@
 #include "APICast.h"
 #include "CallFrameInlines.h"
 #include "Error.h"
+#include "FunctionPrototype.h"
 #include "GetterSetter.h"
 #include "InternalFunction.h"
 #include "JSArrayBuffer.h"
@@ -32,6 +33,7 @@
 #include "JSDestructibleObject.h"
 #include "JSNativeStdFunction.h"
 #include "ObjectConstructor.h"
+#include "TopExceptionScope.h"
 #include "Weak.h"
 #include "WeakInlines.h"
 #include <wtf/HashMap.h>
@@ -364,7 +366,7 @@ public:
             m_count = static_cast<uint32_t>(count);
             return;
         }
-        JSValueRef* values = arity <= inlineCount ? m_inline.data() : (m_heap.resize(arity), m_heap.data());
+        JSValueRef* values = arity <= inlineCount ? m_inline.data() : (m_heap.resize(arity), m_heap.mutableSpan().data());
         for (size_t i = 0; i < arity; ++i)
             values[i] = toRefWithoutGlobalObject(i < count ? callFrame->uncheckedArgument(i) : jsUndefined());
         m_values = values;
@@ -713,7 +715,7 @@ WELD_EXPORT JSValueRef weld_host_cached_string(JSContextRef ctx, JSValueRef clsR
         return nullptr;
     if (JSString* string = cls->cachedString(key))
         return toRef(globalObject, string);
-    JSString* string = jsString(vm, String(std::span { latin1, length }));
+    JSString* string = jsString(vm, String(std::span { reinterpret_cast<const Latin1Character*>(latin1), length }));
     cls->cacheString(vm, key, string);
     return toRef(globalObject, string);
 }
@@ -732,7 +734,7 @@ WELD_EXPORT JSValueRef weld_host_string(JSContextRef ctx, const uint8_t* latin1,
     JSGlobalObject* globalObject = toJS(ctx);
     VM& vm = globalObject->vm();
     JSLockHolder lock(vm);
-    return toRef(globalObject, jsString(vm, String(std::span { latin1, length })));
+    return toRef(globalObject, jsString(vm, String(std::span { reinterpret_cast<const Latin1Character*>(latin1), length })));
 }
 
 WELD_EXPORT JSValueRef weld_host_string16(JSContextRef ctx, const uint16_t* chars, size_t length)

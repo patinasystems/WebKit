@@ -29,6 +29,7 @@
 #include "ModuleAnalyzer.h"
 #include "ModuleRegistryEntry.h"
 #include "Nodes.h"
+#include "ObjectConstructor.h"
 #include "Parser.h"
 #include "ParserError.h"
 #include "TopExceptionScope.h"

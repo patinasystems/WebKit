@@ -90,6 +90,12 @@ void JSAPIGlobalObject::visitChildrenImpl(JSCell* cell, Visitor& visitor)
 
 DEFINE_VISIT_CHILDREN(JSAPIGlobalObject);
 
+ScriptExecutionStatus JSAPIGlobalObject::scriptExecutionStatus(JSGlobalObject* globalObject, JSObject*)
+{
+    // weld_jsc_global_close's one mark: the global's microtasks are discarded from then on.
+    return globalObject->microtaskRunnability() == QueuedTaskResult::Discard ? ScriptExecutionStatus::Stopped : ScriptExecutionStatus::Running;
+}
+
 void JSAPIGlobalObject::setWeldModuleHooks(VM& vm, JSObject* importModule, JSObject* resolveModule)
 {
     m_weldImportModule.setMayBeNull(vm, this, importModule);

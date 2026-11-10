@@ -1,5 +1,5 @@
-// Weld glue (patinasystems/WebKit, API/Weld*): memory back to the OS after a realm closes, length-counted Latin-1
-// strings and heap snapshots, over a C ABI weld-jsc calls (Kitchen lib/Weld/crates/jsc/src/sys.rs).
+// Weld glue (patinasystems/WebKit, API/Weld*): closing a realm, memory back to the OS after it closes, length-counted
+// Latin-1 strings and heap snapshots, over a C ABI weld-jsc calls (Kitchen lib/Weld/crates/jsc/src/sys.rs).
 #include "config.h"
 
 #include "APICast.h"
@@ -16,6 +16,21 @@
 #include <wtf/text/CString.h>
 
 using namespace JSC;
+
+// Closes a realm: it runs no more script. Its queued microtasks are discarded (microtaskRunnability Discard), its
+// pending deferred work (FinalizationRegistry cleanups, Atomics.waitAsync, wasm compiles) is cancelled with its
+// dependencies, and deferred work queued for it later is dropped unrun (JSAPIGlobalObject::scriptExecutionStatus answers
+// Stopped). The embedder frees what the realm's host functions read when it closes the realm, but on a shared VM the
+// global lives on until a collection proves it dead, and a FinalizationRegistry callback run in it meanwhile would read
+// freed memory. Call it before the embedder's last JSGlobalContextRelease. Closing twice is a no-op.
+extern "C" __attribute__((visibility("default"))) void weld_jsc_global_close(JSGlobalContextRef ctx)
+{
+    JSGlobalObject* globalObject = toJS(ctx);
+    VM& vm = globalObject->vm();
+    JSLockHolder lock(vm);
+    globalObject->setMicrotaskRunnability(QueuedTaskResult::Discard);
+    globalObject->clearWeakTickets();
+}
 
 // What a closed realm left behind, back to the OS, keeping the code cache: a full collection now, the heap's empty
 // blocks freed (sweepSynchronously), the parser's per-source caches dropped (they hold their SourceProviders, and so

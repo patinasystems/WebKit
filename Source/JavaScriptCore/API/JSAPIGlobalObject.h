@@ -52,6 +52,9 @@ public:
     static Structure* createStructure(VM&, JSValue prototype);
 
     static void reportUncaughtExceptionAtEventLoop(JSGlobalObject*, Exception*);
+    // Weld (WeldMemory.cpp, weld_jsc_global_close): Stopped once the embedder closed this global, so deferred work
+    // queued for it (a FinalizationRegistry cleanup, say) is dropped, never run; Running before.
+    static ScriptExecutionStatus scriptExecutionStatus(JSGlobalObject*, JSObject*);
 
     JSValue loadAndEvaluateJSScriptModule(const JSLockHolder&, JSScript *);
 

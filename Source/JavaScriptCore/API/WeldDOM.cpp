@@ -19,6 +19,12 @@
 //   DOMJIT call.) They load the link
 //   straight from weld-dom's shared link pages (Rust-owned memory; WeldDomLinks names them) and the
 //   wrapper from the table, inline; a missing wrapper calls web-front's maker.
+// - Structural writes and creates as bindings functions (`appendChild(node, child)`, ...): they hand
+//   the receiver and arguments, as slots and string spans, to the document's Rust verb (`weld_dom_verbs`)
+//   and return true (a create: the new node's wrapper, from the maker, called with (slot, gen)). They
+//   return false (a create: null) and change nothing when the call needs the JS path: an argument that
+//   is not a node of the same document, null or a string; no verb (a create: no maker); a replay
+//   running; or Rust declining it.
 //
 // Rust memory is read only on the mutator thread or while the world is stopped: the weak owner
 // answers "not reachable" during concurrent marking, and the final stopped fixpoint answers for
@@ -72,6 +78,20 @@ struct WeldDomLinks {
     void* changedContext;
     uint64_t* live;
 };
+
+// One argument of a structural write, as the fork hands it to Rust. `chars` is valid only during the call.
+enum : uint32_t { WeldDomArgNull = 0, WeldDomArgNode = 1, WeldDomArgLatin1 = 2, WeldDomArgUTF16 = 3 };
+struct WeldDomArg {
+    uint32_t kind;
+    uint32_t slot;
+    uint32_t gen;
+    uint32_t length;
+    const void* chars;
+};
+
+// Runs `verb` on `args` (args[0] the receiver; a create's is Null, the document), or returns 0 having changed
+// nothing. A create writes the new node's (slot, gen) to `made`. It must not call into JavaScript.
+typedef uint32_t (*WeldDomVerb)(void* context, uint32_t verb, const WeldDomArg* args, uint32_t count, uint32_t* made);
 }
 
 namespace {
@@ -451,6 +471,8 @@ public:
     JSWeldDocument* m_cell { nullptr };
     // `arm` named this table for the next construction: the marking constraint keeps its document.
     bool m_armed { false };
+    WeldDomVerb m_verb { nullptr };
+    void* m_verbContext { nullptr };
     RefPtr<ArrayBuffer> m_typesBuffer;
     Vector<std::pair<uint32_t, uint32_t>> m_owners;
 };
@@ -1164,6 +1186,128 @@ JSC_DEFINE_HOST_FUNCTION(weldIsNative, (JSGlobalObject*, CallFrame* callFrame))
     return JSValue::encode(jsBoolean(!!dynamicDowncast<JSWeldNode>(callFrame->argument(0))));
 }
 
+// ---------------------------------------------------------------- structural writes into Rust
+
+// The verb numbers are the ABI with weld-dom (`links.rs` `verb`, weld-jsc `dom::verb`).
+enum class Verb : uint32_t {
+    CreateElement = 0,
+    CreateText = 1,
+    CreateComment = 2,
+    AppendChild = 3,
+    InsertBefore = 4,
+    RemoveChild = 5,
+    ReplaceChild = 6,
+    Remove = 7,
+    Before = 8,
+    After = 9,
+    Append = 10,
+    Prepend = 11,
+    ReplaceWith = 12,
+    SetAttribute = 13,
+    RemoveAttribute = 14,
+    SetTextContent = 15,
+    SetData = 16,
+};
+
+constexpr size_t kInlineArgs = 8;
+
+// The arguments from `from` on, or false when one is not a node of `table`, null or a string (a value
+// whose conversion can run script).
+bool verbArgs(JSGlobalObject* globalObject, WeldDomTable& table, CallFrame* callFrame, unsigned from, Vector<WeldDomArg, kInlineArgs>& args, Vector<String, kInlineArgs>& strings)
+{
+    VM& vm = globalObject->vm();
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    size_t count = callFrame->argumentCount();
+    for (size_t i = from; i < count; ++i) {
+        JSValue value = callFrame->uncheckedArgument(i);
+        if (auto* node = dynamicDowncast<JSWeldNode>(value)) {
+            if (node->table() != &table)
+                return false;
+            args.append({ WeldDomArgNode, node->slot(), node->native().gen, 0, nullptr });
+        } else if (value.isNull())
+            args.append({ WeldDomArgNull, kNone, 0, 0, nullptr });
+        else if (value.isString()) {
+            String string = value.toWTFString(globalObject);
+            RETURN_IF_EXCEPTION(scope, false);
+            StringImpl* impl = string.impl();
+            if (!impl || !impl->length())
+                args.append({ WeldDomArgLatin1, 0, 0, 0, "" });
+            else if (impl->is8Bit())
+                args.append({ WeldDomArgLatin1, 0, 0, impl->length(), impl->span8().data() });
+            else
+                args.append({ WeldDomArgUTF16, 0, 0, impl->length(), impl->span16().data() });
+            strings.append(WTF::move(string));
+        } else
+            return false;
+    }
+    return true;
+}
+
+template<Verb verb>
+EncodedJSValue runVerb(JSGlobalObject* globalObject, CallFrame* callFrame)
+{
+    VM& vm = globalObject->vm();
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    constexpr bool create = verb == Verb::CreateElement || verb == Verb::CreateText || verb == Verb::CreateComment;
+    auto declined = [] { return JSValue::encode(create ? jsNull() : jsBoolean(false)); };
+    Vector<WeldDomArg, kInlineArgs> args;
+    [[maybe_unused]] JSWeldDocument* doc = nullptr;
+    WeldDomTable* table = nullptr;
+    if constexpr (create) {
+        doc = documentArg(callFrame, 0);
+        if (!doc || !doc->m_maker)
+            return declined();
+        table = &doc->table();
+        args.append({ WeldDomArgNull, kNone, 0, 0, nullptr });
+    } else {
+        auto* node = dynamicDowncast<JSWeldNode>(callFrame->argument(0));
+        if (!node || !node->table())
+            return declined();
+        table = node->table();
+        args.append({ WeldDomArgNode, node->slot(), node->native().gen, 0, nullptr });
+    }
+    if (!table->m_verb || table->m_replaying)
+        return declined();
+    Vector<String, kInlineArgs> strings;
+    bool usable = verbArgs(globalObject, *table, callFrame, 1, args, strings);
+    RETURN_IF_EXCEPTION(scope, { });
+    if (!usable)
+        return declined();
+    std::array<uint32_t, 2> made { kNone, 0 };
+    if (!table->m_verb(table->m_verbContext, static_cast<uint32_t>(verb), args.span().data(), static_cast<uint32_t>(args.size()), made.data()))
+        return declined();
+    if constexpr (create) {
+        JSObject* maker = doc->m_maker.get();
+        MarkedArgumentBuffer makerArgs;
+        makerArgs.append(jsNumber(made[0]));
+        makerArgs.append(jsNumber(made[1]));
+        auto callData = JSC::getCallData(maker);
+        JSValue wrapper = call(globalObject, maker, callData, jsUndefined(), makerArgs);
+        RETURN_IF_EXCEPTION(scope, { });
+        ensureStillAliveHere(doc);
+        return JSValue::encode(wrapper);
+    }
+    return JSValue::encode(jsBoolean(true));
+}
+
+JSC_DEFINE_HOST_FUNCTION(weldVerbCreateElement, (JSGlobalObject* globalObject, CallFrame* callFrame)) { return runVerb<Verb::CreateElement>(globalObject, callFrame); }
+JSC_DEFINE_HOST_FUNCTION(weldVerbCreateText, (JSGlobalObject* globalObject, CallFrame* callFrame)) { return runVerb<Verb::CreateText>(globalObject, callFrame); }
+JSC_DEFINE_HOST_FUNCTION(weldVerbCreateComment, (JSGlobalObject* globalObject, CallFrame* callFrame)) { return runVerb<Verb::CreateComment>(globalObject, callFrame); }
+JSC_DEFINE_HOST_FUNCTION(weldVerbAppendChild, (JSGlobalObject* globalObject, CallFrame* callFrame)) { return runVerb<Verb::AppendChild>(globalObject, callFrame); }
+JSC_DEFINE_HOST_FUNCTION(weldVerbInsertBefore, (JSGlobalObject* globalObject, CallFrame* callFrame)) { return runVerb<Verb::InsertBefore>(globalObject, callFrame); }
+JSC_DEFINE_HOST_FUNCTION(weldVerbRemoveChild, (JSGlobalObject* globalObject, CallFrame* callFrame)) { return runVerb<Verb::RemoveChild>(globalObject, callFrame); }
+JSC_DEFINE_HOST_FUNCTION(weldVerbReplaceChild, (JSGlobalObject* globalObject, CallFrame* callFrame)) { return runVerb<Verb::ReplaceChild>(globalObject, callFrame); }
+JSC_DEFINE_HOST_FUNCTION(weldVerbRemove, (JSGlobalObject* globalObject, CallFrame* callFrame)) { return runVerb<Verb::Remove>(globalObject, callFrame); }
+JSC_DEFINE_HOST_FUNCTION(weldVerbBefore, (JSGlobalObject* globalObject, CallFrame* callFrame)) { return runVerb<Verb::Before>(globalObject, callFrame); }
+JSC_DEFINE_HOST_FUNCTION(weldVerbAfter, (JSGlobalObject* globalObject, CallFrame* callFrame)) { return runVerb<Verb::After>(globalObject, callFrame); }
+JSC_DEFINE_HOST_FUNCTION(weldVerbAppend, (JSGlobalObject* globalObject, CallFrame* callFrame)) { return runVerb<Verb::Append>(globalObject, callFrame); }
+JSC_DEFINE_HOST_FUNCTION(weldVerbPrepend, (JSGlobalObject* globalObject, CallFrame* callFrame)) { return runVerb<Verb::Prepend>(globalObject, callFrame); }
+JSC_DEFINE_HOST_FUNCTION(weldVerbReplaceWith, (JSGlobalObject* globalObject, CallFrame* callFrame)) { return runVerb<Verb::ReplaceWith>(globalObject, callFrame); }
+JSC_DEFINE_HOST_FUNCTION(weldVerbSetAttribute, (JSGlobalObject* globalObject, CallFrame* callFrame)) { return runVerb<Verb::SetAttribute>(globalObject, callFrame); }
+JSC_DEFINE_HOST_FUNCTION(weldVerbRemoveAttribute, (JSGlobalObject* globalObject, CallFrame* callFrame)) { return runVerb<Verb::RemoveAttribute>(globalObject, callFrame); }
+JSC_DEFINE_HOST_FUNCTION(weldVerbSetTextContent, (JSGlobalObject* globalObject, CallFrame* callFrame)) { return runVerb<Verb::SetTextContent>(globalObject, callFrame); }
+JSC_DEFINE_HOST_FUNCTION(weldVerbSetData, (JSGlobalObject* globalObject, CallFrame* callFrame)) { return runVerb<Verb::SetData>(globalObject, callFrame); }
+
 WTF_ALLOW_UNSAFE_BUFFER_USAGE_END
 
 } // namespace
@@ -1197,6 +1341,23 @@ extern "C" __attribute__((visibility("default"))) JSValueRef weld_dom_bindings(J
     function("owner"_s, 3, weldOwner);
     function("cellSize"_s, 0, weldCellSize);
     function("isNative"_s, 1, weldIsNative);
+    function("createElement"_s, 2, weldVerbCreateElement);
+    function("createTextNode"_s, 2, weldVerbCreateText);
+    function("createComment"_s, 2, weldVerbCreateComment);
+    function("appendChild"_s, 2, weldVerbAppendChild);
+    function("insertBefore"_s, 3, weldVerbInsertBefore);
+    function("removeChild"_s, 2, weldVerbRemoveChild);
+    function("replaceChild"_s, 3, weldVerbReplaceChild);
+    function("remove"_s, 1, weldVerbRemove);
+    function("before"_s, 1, weldVerbBefore);
+    function("after"_s, 1, weldVerbAfter);
+    function("append"_s, 1, weldVerbAppend);
+    function("prepend"_s, 1, weldVerbPrepend);
+    function("replaceWith"_s, 1, weldVerbReplaceWith);
+    function("setAttribute"_s, 3, weldVerbSetAttribute);
+    function("removeAttribute"_s, 2, weldVerbRemoveAttribute);
+    function("setTextContent"_s, 2, weldVerbSetTextContent);
+    function("setData"_s, 2, weldVerbSetData);
     return toRef(globalObject, bindings);
 }
 
@@ -1233,5 +1394,20 @@ extern "C" __attribute__((visibility("default"))) int weld_dom_slot_of(JSContext
     *gen = node->native().gen;
     if (document)
         *document = node->table()->m_releaseContext;
+    return 1;
+}
+
+// The structural writes of `document` (a weld_dom_document value) go to `verb(context, ...)`; null turns them off,
+// so every one takes the JS path. `context` must stay valid until the table's `release` runs or this is called again.
+// 0 when `document` is not a document.
+extern "C" __attribute__((visibility("default"))) int weld_dom_verbs(JSContextRef ctx, JSValueRef document, WeldDomVerb verb, void* context)
+{
+    JSGlobalObject* globalObject = toJS(ctx);
+    JSLockHolder lock(globalObject->vm());
+    auto* doc = document ? dynamicDowncast<JSWeldDocument>(toJS(globalObject, document)) : nullptr;
+    if (!doc)
+        return 0;
+    doc->table().m_verb = verb;
+    doc->table().m_verbContext = verb ? context : nullptr;
     return 1;
 }

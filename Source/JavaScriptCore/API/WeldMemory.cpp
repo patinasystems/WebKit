@@ -3,11 +3,13 @@
 #include "config.h"
 
 #include "APICast.h"
+#include "CodeBlock.h"
 #include "DeferGCInlines.h"
 #include "Heap.h"
 #include "HeapProfiler.h"
 #include "HeapSnapshotBuilder.h"
 #include "InitializeThreading.h"
+#include "JITWorklist.h"
 #include "JSCInlines.h"
 #include "OpaqueJSString.h"
 #include "SourceProviderCache.h"
@@ -32,11 +34,18 @@ extern "C" __attribute__((visibility("default"))) void weld_jsc_global_close(JSG
     globalObject->clearWeakTickets();
 }
 
-// What a closed realm left behind, back to the OS, keeping the code cache: a full collection now, the heap's empty
-// blocks freed (sweepSynchronously), the parser's per-source caches dropped (they hold their SourceProviders, and so
-// a closed page's source text), then malloc's free pages returned (WTF::releaseFastMallocFreeMemory: the bmalloc or
-// libpas scavenger, synchronously). Linked and unlinked code stay: no deleteAllCode, so a page loaded again finds
-// its code cached. Under JS (a host call) only the collection and the scavenge run; the caches stay.
+// What a closed realm left behind, back to the OS, keeping the code cache: the VM's JIT plans completed, the
+// optimized code of closed globals jettisoned, a full collection now, the heap's empty blocks freed
+// (sweepSynchronously), the parser's per-source caches dropped (they hold their SourceProviders, and so a closed
+// page's source text), then malloc's free pages returned (WTF::releaseFastMallocFreeMemory: the bmalloc or libpas
+// scavenger, synchronously). Live globals' code and all unlinked code stay: no deleteAllCode, so a page loaded again
+// finds its code cached. Under JS (a host call) the caches stay.
+//
+// A finished concurrent compile waits in the worklist until the VM's next tier-up, and its plan keeps the code
+// blocks, structures and global it compiled against alive; a closed global's DFG/FTL code keeps the global marked
+// through its weak references for as long as the code lives. Either keeps a closed realm's whole heap.
+// JettisonDueToVMTraps invalidates the code in place (as VMTraps does for code on the stack), so a frame of it still
+// on the stack exits to baseline when it is returned to.
 extern "C" __attribute__((visibility("default"))) void weld_jsc_release_free_memory(JSContextGroupRef group)
 {
     VM& vm = *toJS(group);
@@ -49,6 +58,19 @@ extern "C" __attribute__((visibility("default"))) void weld_jsc_release_free_mem
             vm.clearLastException();
             vm.sourceProviderCacheMap.clear();
         }
+#if ENABLE(JIT)
+        if (auto* worklist = JITWorklist::existingGlobalWorklistOrNull())
+            worklist->completeAllPlansForVM(vm);
+#endif
+#if ENABLE(DFG_JIT)
+        vm.heap.forEachCodeBlock([&](CodeBlock* codeBlock) {
+            if (!JSC::JITCode::isOptimizingJIT(codeBlock->jitType()) || codeBlock->isJettisoned())
+                return;
+            JSGlobalObject* globalObject = codeBlock->globalObject();
+            if (globalObject && globalObject->microtaskRunnability() == QueuedTaskResult::Discard)
+                codeBlock->jettison(Profiler::JettisonDueToVMTraps);
+        });
+#endif
         vm.heap.collectNow(Synchronousness::Sync, CollectionScope::Full);
         if (idle)
             vm.heap.sweepSynchronously();

@@ -1,8 +1,9 @@
 // Weld glue (patinasystems/WebKit, API/Weld*): closing a realm, memory back to the OS after it closes, length-counted
-// Latin-1 strings and heap snapshots, over a C ABI weld-jsc calls (Kitchen lib/Weld/crates/jsc/src/sys.rs).
+// Latin-1 strings, heap snapshots and two read-only JIT test probes, over a C ABI weld-jsc calls (Kitchen lib/Weld/crates/jsc/src/sys.rs).
 #include "config.h"
 
 #include "APICast.h"
+#include "CodeBlock.h"
 #include "DeferGCInlines.h"
 #include "Heap.h"
 #include "HeapProfiler.h"
@@ -12,6 +13,7 @@
 #include "JSCInlines.h"
 #include "OpaqueJSString.h"
 #include "SourceProviderCache.h"
+#include "StackVisitor.h"
 #include <stdio.h>
 #include <wtf/FastMalloc.h>
 #include <wtf/text/CString.h>
@@ -100,4 +102,52 @@ extern "C" __attribute__((visibility("default"))) size_t weld_jsc_heap_snapshot(
     if (fclose(file) || written != utf8.length())
         return 0;
     return written;
+}
+
+// Test probes: read-only, no side effects, for tests that must prove a JIT premise. Not for product code.
+//
+// The JIT tier of the nearest JS frame below the current host call: 0 LLInt or none, 1 Baseline, 2 DFG, 3 FTL. A frame
+// the DFG inlined reports its own Baseline code block, so it reads 1 even inside optimized code. -1 outside a host call.
+extern "C" __attribute__((visibility("default"))) int weld_jsc_test_caller_tier(JSContextRef ctx)
+{
+    JSGlobalObject* globalObject = toJS(ctx);
+    VM& vm = globalObject->vm();
+    JSLockHolder lock(vm);
+    if (!vm.topCallFrame)
+        return -1;
+    int tier = -1;
+    StackVisitor::visit(vm.topCallFrame, vm, [&](StackVisitor& visitor) -> IterationStatus {
+        CodeBlock* codeBlock = visitor->codeBlock();
+        if (!codeBlock)
+            return IterationStatus::Continue;
+        switch (codeBlock->jitType()) {
+        case JITType::BaselineJIT:
+            tier = 1;
+            break;
+        case JITType::DFGJIT:
+            tier = 2;
+            break;
+        case JITType::FTLJIT:
+            tier = 3;
+            break;
+        default:
+            tier = 0;
+            break;
+        }
+        return IterationStatus::Done;
+    });
+    return tier;
+}
+
+// JIT plans queued or compiling in the process's worklist, for every VM (a finished plan waiting to be installed is not
+// counted). Reads only.
+extern "C" __attribute__((visibility("default"))) size_t weld_jsc_test_jit_plans_in_flight(JSContextGroupRef group)
+{
+    VM& vm = *toJS(group);
+    JSLockHolder lock(vm);
+#if ENABLE(JIT)
+    if (auto* worklist = JITWorklist::existingGlobalWorklistOrNull())
+        return worklist->queueLength() + worklist->totalOngoingCompilations();
+#endif
+    return 0;
 }

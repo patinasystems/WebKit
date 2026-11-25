@@ -3,6 +3,7 @@
 #include "config.h"
 
 #include "APICast.h"
+#include "CodeBlock.h"
 #include "DeferGCInlines.h"
 #include "Heap.h"
 #include "HeapProfiler.h"
@@ -10,7 +11,9 @@
 #include "InitializeThreading.h"
 #include "JSCInlines.h"
 #include "OpaqueJSString.h"
+#include "JITWorklist.h"
 #include "SourceProviderCache.h"
+#include "StackVisitor.h"
 #include <stdio.h>
 #include <wtf/FastMalloc.h>
 #include <wtf/text/CString.h>
@@ -92,4 +95,56 @@ extern "C" __attribute__((visibility("default"))) size_t weld_jsc_heap_snapshot(
     if (fclose(file) || written != utf8.length())
         return 0;
     return written;
+}
+
+// Test probes: read-only, no side effects, for tests that must prove a JIT premise. Not for product code.
+//
+// The JIT tier of the nearest JS frame below the current host call: 0 LLInt or none, 1 Baseline, 2 DFG, 3 FTL. A frame
+// the DFG inlined reports its own Baseline code block, so it reads 1 even inside optimized code. -1 outside a host call.
+extern "C" __attribute__((visibility("default"))) int weld_jsc_test_caller_tier(JSContextRef ctx)
+{
+    JSGlobalObject* globalObject = toJS(ctx);
+    VM& vm = globalObject->vm();
+    JSLockHolder lock(vm);
+    if (!vm.topCallFrame)
+        return -1;
+    int tier = -1;
+    StackVisitor::visit(vm.topCallFrame, vm, [&](StackVisitor& visitor) -> IterationStatus {
+        CodeBlock* codeBlock = visitor->codeBlock();
+        if (!codeBlock)
+            return IterationStatus::Continue;
+        switch (codeBlock->jitType()) {
+        case JITType::BaselineJIT:
+            tier = 1;
+            break;
+        case JITType::DFGJIT:
+            tier = 2;
+            break;
+        case JITType::FTLJIT:
+            tier = 3;
+            break;
+        default:
+            tier = 0;
+            break;
+        }
+        return IterationStatus::Done;
+    });
+    return tier;
+}
+
+// Every JIT plan the worklist holds for the group's VM: queued, compiling, or finished and waiting to be installed (the
+// plans completeAllPlansForVM installs); `*ready` (if not null) gets the finished ones. Reads only.
+extern "C" __attribute__((visibility("default"))) size_t weld_jsc_test_jit_plans(JSContextGroupRef group, size_t* ready)
+{
+    VM& vm = *toJS(group);
+    JSLockHolder lock(vm);
+    size_t count = 0;
+    size_t finished = 0;
+#if ENABLE(JIT)
+    if (auto* worklist = JITWorklist::existingGlobalWorklistOrNull())
+        count = worklist->planCountForVM(vm, finished);
+#endif
+    if (ready)
+        *ready = finished;
+    return count;
 }

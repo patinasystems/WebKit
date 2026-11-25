@@ -87,6 +87,9 @@ public:
 
     size_t totalOngoingCompilations() const;
 
+    // Every plan the worklist holds for the VM, queued, compiling or ready to install; `ready` gets the ready ones.
+    size_t planCountForVM(VM&, size_t& ready) const;
+
 private:
     JITWorklist();
 

@@ -139,15 +139,19 @@ extern "C" __attribute__((visibility("default"))) int weld_jsc_test_caller_tier(
     return tier;
 }
 
-// JIT plans queued or compiling in the process's worklist, for every VM (a finished plan waiting to be installed is not
-// counted). Reads only.
-extern "C" __attribute__((visibility("default"))) size_t weld_jsc_test_jit_plans_in_flight(JSContextGroupRef group)
+// Every JIT plan the worklist holds for the group's VM: queued, compiling, or finished and waiting to be installed (the
+// plans completeAllPlansForVM installs); `*ready` (if not null) gets the finished ones. Reads only.
+extern "C" __attribute__((visibility("default"))) size_t weld_jsc_test_jit_plans(JSContextGroupRef group, size_t* ready)
 {
     VM& vm = *toJS(group);
     JSLockHolder lock(vm);
+    size_t count = 0;
+    size_t finished = 0;
 #if ENABLE(JIT)
     if (auto* worklist = JITWorklist::existingGlobalWorklistOrNull())
-        return worklist->queueLength() + worklist->totalOngoingCompilations();
+        count = worklist->planCountForVM(vm, finished);
 #endif
-    return 0;
+    if (ready)
+        *ready = finished;
+    return count;
 }

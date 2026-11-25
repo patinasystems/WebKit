@@ -200,6 +200,21 @@ size_t JITWorklist::totalOngoingCompilations() const
     return totalOngoingCompilations(locker);
 }
 
+size_t JITWorklist::planCountForVM(VM& vm, size_t& ready) const
+{
+    Locker locker { *m_lock };
+    size_t count = 0;
+    ready = 0;
+    for (const auto& entry : m_plans) {
+        if (entry.value->vm() != &vm)
+            continue;
+        ++count;
+        if (entry.value->stage() == JITPlanStage::Ready)
+            ++ready;
+    }
+    return count;
+}
+
 size_t JITWorklist::totalOngoingCompilations(const AbstractLocker&) const
 {
     size_t total = 0;
